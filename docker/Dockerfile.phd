@@ -1,0 +1,41 @@
+FROM osrf/ros:humble-desktop AS base
+
+ENV ROS_DISTRO=humble
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /ros2_ws/src
+
+RUN apt-get update && apt-get install -y \
+    python3-colcon-common-extensions \
+    && apt-get install -y python3.10-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN source /opt/ros/$ROS_DISTRO/setup.bash && ros2 pkg create --build-type ament_python --license Apache-2.0 phd_semantic_nav
+
+COPY ./AudioCLIP /ros2_ws/src/phd_semantic_nav/AudioCLIP
+
+RUN python3 -m venv --system-site-packages /ros2_ws/src/phd_semantic_nav/.venv/audioclip
+WORKDIR /ros2_ws/src/phd_semantic_nav/AudioCLIP
+RUN . /ros2_ws/src/phd_semantic_nav/.venv/audioclip/bin/activate && pip install --no-cache-dir -r requirements.txt
+
+FROM base AS dev
+
+WORKDIR /ros2_ws
+CMD ["bash"]
+
+FROM base AS production
+
+COPY ./phd_semantic_nav/launch /ros2_ws/src/phd_semantic_nav/launch
+COPY ./phd_semantic_nav/phd_semantic_nav /ros2_ws/src/phd_semantic_nav/phd_semantic_nav
+COPY ./phd_semantic_nav/rviz /ros2_ws/src/phd_semantic_nav/rviz
+COPY ./phd_semantic_nav/scripts /ros2_ws/src/phd_semantic_nav/scripts
+COPY ./phd_semantic_nav/package.xml /ros2_ws/src/phd_semantic_nav/package.xml
+COPY ./phd_semantic_nav/setup.py /ros2_ws/src/phd_semantic_nav/setup.py
+
+WORKDIR /ros2_ws
+RUN source /opt/ros/$ROS_DISTRO/setup.bash && colcon build
+
+# RUN echo "source /opt/ros/$ROS_DISTRO/setup.bash" >> ~/.bashrc && \
+#     echo "source /ros2_ws/install/setup.bash" >> ~/.bashrc
+
+CMD ["bash"]

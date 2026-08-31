@@ -1,0 +1,26 @@
+services:
+  rviz2:
+    image: rosrviz
+    container_name: odas_rviz
+    network_mode: host
+    ipc: host
+    pid: host
+    environment:
+      - ROS_DOMAIN_ID=43
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - DISPLAY=$DISPLAY
+      - XAUTHORITY=/tmp/.docker.xauth
+    volumes:
+      - $XAUTHORITY:/tmp/.docker.xauth
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./odas_rviz.rviz:/odas_rviz.rviz
+    command: ros2 run rviz2 rviz2 -d /odas_rviz.rviz
+  
+  phd_semantic_nav:
+    image: rosaudioclip
+    container_name: phd_semantic_nav
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=43
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    command: bash -c "source install/setup.bash && ros2 launch phd_semantic_nav phd_semantic_nav.launch.py"
