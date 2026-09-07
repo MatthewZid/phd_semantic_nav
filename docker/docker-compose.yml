@@ -6,7 +6,7 @@ services:
     ipc: host
     pid: host
     environment:
-      - ROS_DOMAIN_ID=43
+      - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - DISPLAY=$DISPLAY
       - XAUTHORITY=/tmp/.docker.xauth
@@ -21,6 +21,6 @@ services:
     container_name: phd_semantic_nav
     network_mode: host
     environment:
-      - ROS_DOMAIN_ID=43
+      - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     command: bash -c "source install/setup.bash && ros2 launch phd_semantic_nav phd_semantic_nav.launch.py"
