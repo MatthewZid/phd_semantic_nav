@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
-import os
 from glob import glob
+import os
 
 package_name = 'phd_semantic_nav'
 
@@ -29,7 +29,6 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*')),
-        (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
     ],  # + production_manifests('.venv', 'AudioCLIP')
     install_requires=['setuptools'],
     zip_safe=True,
@@ -44,12 +43,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            # 'odas_sub = phd_semantic_nav.odas_sub:main',
-            'audioclip = phd_semantic_nav.audioclip:main',
-            # 'hydra_sub = phd_semantic_nav.hydra_sub:main'
+            'audioclip = phd_semantic_nav.audioclip:main'
         ],
     },
-    scripts=[
-        'scripts/uma16v2_pos_setup.py',
-    ],
 )
