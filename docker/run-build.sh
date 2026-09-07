@@ -1,14 +1,14 @@
 #!/bin/bash
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-cd $SCRIPT_DIR
+cd $SCRIPT_DIR/..
 
 debug="true"
 
 docker build -t rosrviz .
 
 if [ "$debug" = "true" ]; then
-    docker build --target dev -t rosaudioclip -f Dockerfile.phd .
+    docker build --target dev -t rosaudioclip -f docker/Dockerfile.phd .
 else
-    docker build --target production -t rosaudioclip -f Dockerfile.phd .
+    docker build --target production -t rosaudioclip -f docker/Dockerfile.phd .
 fi

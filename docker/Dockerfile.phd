@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y \
 
 # RUN source /opt/ros/$ROS_DISTRO/setup.bash && ros2 pkg create --build-type ament_python --license Apache-2.0 phd_semantic_nav
 
-COPY .. /ros2_ws/src/phd_semantic_nav
 COPY ./AudioCLIP /ros2_ws/src/phd_semantic_nav/AudioCLIP
 
 RUN python3 -m venv --system-site-packages /ros2_ws/src/phd_semantic_nav/.venv/audioclip
@@ -26,12 +25,14 @@ CMD ["bash"]
 
 FROM base AS production
 
-# COPY ./phd_semantic_nav/launch /ros2_ws/src/phd_semantic_nav/launch
-# COPY ./phd_semantic_nav/phd_semantic_nav /ros2_ws/src/phd_semantic_nav/phd_semantic_nav
-# COPY ./phd_semantic_nav/rviz /ros2_ws/src/phd_semantic_nav/rviz
-# COPY ./phd_semantic_nav/scripts /ros2_ws/src/phd_semantic_nav/scripts
-# COPY ./phd_semantic_nav/package.xml /ros2_ws/src/phd_semantic_nav/package.xml
-# COPY ./phd_semantic_nav/setup.py /ros2_ws/src/phd_semantic_nav/setup.py
+COPY ./launch /ros2_ws/src/phd_semantic_nav/launch
+COPY ./phd_semantic_nav /ros2_ws/src/phd_semantic_nav/phd_semantic_nav
+COPY ./resource /ros2_ws/src/phd_semantic_nav/resource
+COPY ./test /ros2_ws/src/phd_semantic_nav/test
+COPY ./LICENSE /ros2_ws/src/phd_semantic_nav/LICENSE
+COPY ./package.xml /ros2_ws/src/phd_semantic_nav/package.xml
+COPY ./setup.cfg /ros2_ws/src/phd_semantic_nav/setup.cfg
+COPY ./setup.py /ros2_ws/src/phd_semantic_nav/setup.py
 
 WORKDIR /ros2_ws
 RUN source /opt/ros/$ROS_DISTRO/setup.bash && colcon build

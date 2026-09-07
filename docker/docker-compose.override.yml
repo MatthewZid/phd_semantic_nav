@@ -1,13 +1,14 @@
 services:
   phd_semantic_nav:
       volumes:
-        # - ./phd_semantic_nav/launch:/ros2_ws/src/phd_semantic_nav/launch
-        # - ./phd_semantic_nav/phd_semantic_nav:/ros2_ws/src/phd_semantic_nav/phd_semantic_nav
-        # - ./phd_semantic_nav/rviz:/ros2_ws/src/phd_semantic_nav/rviz
-        # - ./phd_semantic_nav/scripts:/ros2_ws/src/phd_semantic_nav/scripts
-        # - ./phd_semantic_nav/package.xml:/ros2_ws/src/phd_semantic_nav/package.xml
-        # - ./phd_semantic_nav/setup.py:/ros2_ws/src/phd_semantic_nav/setup.py
-        - ..:/ros2_ws/src/phd_semantic_nav
-        - ./AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav:/ros2_ws/src/phd_semantic_nav/AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav
+        - ../launch:/ros2_ws/src/phd_semantic_nav/launch
+        - ../phd_semantic_nav:/ros2_ws/src/phd_semantic_nav/phd_semantic_nav
+        - ../resource:/ros2_ws/src/phd_semantic_nav/resource
+        - ../test:/ros2_ws/src/phd_semantic_nav/test
+        - ../LICENSE:/ros2_ws/src/phd_semantic_nav/LICENSE
+        - ../package.xml:/ros2_ws/src/phd_semantic_nav/package.xml
+        - ../setup.cfg:/ros2_ws/src/phd_semantic_nav/setup.cfg
+        - ../setup.py:/ros2_ws/src/phd_semantic_nav/setup.py
+        # - ./AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav:/ros2_ws/src/phd_semantic_nav/AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav
       command: >
         bash -c "source /opt/ros/humble/setup.bash && colcon build && source install/setup.bash && ros2 launch phd_semantic_nav phd_semantic_nav.launch.py"
