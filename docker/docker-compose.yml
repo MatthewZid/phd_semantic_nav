@@ -13,13 +13,14 @@ services:
     volumes:
       - $XAUTHORITY:/tmp/.docker.xauth
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      - ./odas_rviz.rviz:/odas_rviz.rviz
-    command: ros2 run rviz2 rviz2 -d /odas_rviz.rviz
+      - ./main.rviz:/main.rviz
+    command: ros2 run rviz2 rviz2 -d /main.rviz
   
   phd_semantic_nav:
     image: rosaudioclip
     container_name: phd_semantic_nav
     network_mode: host
+    ipc: host
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

@@ -9,6 +9,9 @@ services:
         - ../package.xml:/ros2_ws/src/phd_semantic_nav/package.xml
         - ../setup.cfg:/ros2_ws/src/phd_semantic_nav/setup.cfg
         - ../setup.py:/ros2_ws/src/phd_semantic_nav/setup.py
+        - ../../phd_msgs:/ros2_ws/src/phd_msgs
+        - ../../odas_ros:/ros2_ws/src/odas_ros
+        - ../../audio_utils:/ros2_ws/src/audio_utils
         # - ./AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav:/ros2_ws/src/phd_semantic_nav/AudioCLIP/demo/audio/alarm_clock_3-120526-B-37.wav
       command: >
-        bash -c "source /opt/ros/humble/setup.bash && colcon build && source install/setup.bash && ros2 launch phd_semantic_nav phd_semantic_nav.launch.py"
+        bash -c "source /opt/ros/humble/setup.bash && colcon build --packages-select audio_utils_msgs odas_ros_msgs phd_msgs phd_semantic_nav && source install/setup.bash && ros2 launch phd_semantic_nav phd_semantic_nav.launch.py"
