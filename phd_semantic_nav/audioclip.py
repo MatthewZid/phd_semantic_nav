@@ -32,6 +32,8 @@ import librosa
 import glob
 from collections import defaultdict, deque
 from visualization_msgs.msg import Marker, MarkerArray
+from itertools import combinations
+from geometry_msgs.msg import Point
 
 torch.set_grad_enabled(False)
 # torch.set_num_threads(2)  # Give PyTorch 2 dedicated cores for efficient matrix batching
@@ -110,7 +112,12 @@ class AudioCLIPSub(Node):
             'alarm clock'
         ]
 
-        self.visual_graph = {}  # 3DSG-like structure (only nodes for now)
+        self.visual_graph_nodes = {}  # 3DSG-like structure (only nodes for now)
+        self.visual_graph_edges = {}
+        self.visual_area_nodes = {}
+        self.visual_area_edges = {}
+        self.object_to_area = {}
+        self.next_area_id = 0
         self.obs_cache = defaultdict(lambda: deque(maxlen=20)) # cache memory for recent visual observation messages
         self.wo_lock = threading.Lock()
 
@@ -143,44 +150,364 @@ class AudioCLIPSub(Node):
         self.obs_sub = self.create_subscription(VisualObservationArray, '/object_observations', self.vo_callback, observation_qos)
         self.obs_sub  # prevent unused variable warning
 
+        self.visual_graph_edge_viz_pub = self.create_publisher(Marker, '/camera_pipeline/edge_markers', 10)
+
         self.thread = threading.Thread(target=self.inference_thread, daemon=True)
         self.thread.start()
 
     def wo_callback(self, msg):
+        timestamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
         with self.wo_lock:
             for world_object in msg.objects:
                 object_id = int(world_object.world_object_id)
-                if object_id not in self.visual_graph.keys():
-                    self.visual_graph[object_id] = {
+                if object_id not in self.visual_graph_nodes.keys():
+                    self.visual_graph_nodes[object_id] = {
                         'world_object_id': object_id,
                         'first_seen': world_object.first_seen,
                         'state_history': deque(maxlen=100)
                     }
 
-                self.visual_graph[object_id]['timestamp_ns'] = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                self.visual_graph[object_id]['label'] = str(world_object.label)
-                self.visual_graph[object_id]['label_confidence'] = world_object.label_confidence
-                self.visual_graph[object_id]['position'] = np.array([world_object.position.x, world_object.position.y, world_object.position.z])
-                self.visual_graph[object_id]['velocity'] = np.array([world_object.velocity.x, world_object.velocity.y, world_object.velocity.z])
-                self.visual_graph[object_id]['radius_m'] = world_object.radius_m
-                self.visual_graph[object_id]['position_uncertainty_m'] = world_object.position_uncertainty_m
-                self.visual_graph[object_id]['last_seen'] = world_object.last_seen
-                self.visual_graph[object_id]['active'] = world_object.active
-                self.visual_graph[object_id]['observation_count'] = world_object.observation_count
-                self.visual_graph[object_id]['vision_track_ids'] = sorted(int(t_id) for t_id in world_object.vision_track_ids)
+                self.visual_graph_nodes[object_id]['timestamp_ns'] = timestamp_ns
+                self.visual_graph_nodes[object_id]['label'] = str(world_object.label)
+                self.visual_graph_nodes[object_id]['label_confidence'] = world_object.label_confidence
+                self.visual_graph_nodes[object_id]['position_map'] = np.array([world_object.position.x, world_object.position.y, world_object.position.z])
+                self.visual_graph_nodes[object_id]['velocity_map'] = np.array([world_object.velocity.x, world_object.velocity.y, world_object.velocity.z])
+                self.visual_graph_nodes[object_id]['radius_m'] = world_object.radius_m
+                self.visual_graph_nodes[object_id]['position_uncertainty_m'] = world_object.position_uncertainty_m
+                self.visual_graph_nodes[object_id]['last_seen'] = world_object.last_seen
+                self.visual_graph_nodes[object_id]['active'] = world_object.active
+                self.visual_graph_nodes[object_id]['observation_count'] = world_object.observation_count
+                self.visual_graph_nodes[object_id]['vision_track_ids'] = sorted(int(t_id) for t_id in world_object.vision_track_ids)
 
                 last_seen_ns = world_object.last_seen.sec * 1_000_000_000 + world_object.last_seen.nanosec
-                if not self.visual_graph[object_id]['state_history'] or self.visual_graph[object_id]['state_history'][-1]['timestamp_ns'] != last_seen_ns:
+                if not self.visual_graph_nodes[object_id]['state_history'] or self.visual_graph_nodes[object_id]['state_history'][-1]['timestamp_ns'] != last_seen_ns:
                     state = {
                         'timestamp_ns': last_seen_ns,
                         'position_map': np.array([world_object.position.x, world_object.position.y, world_object.position.z], dtype=np.float64),
                         'velocity_map': np.array([world_object.velocity.x, world_object.velocity.y, world_object.velocity.z], dtype=np.float64),
                         'radius_m': float(world_object.radius_m),
-                        'uncertainty_m': float(world_object.position_uncertainty_m),
+                        'position_uncertainty_m': float(world_object.position_uncertainty_m),
                         'active': bool(world_object.active),
                     }
 
-                    self.visual_graph[object_id]['state_history'].append(state)
+                    self.visual_graph_nodes[object_id]['state_history'].append(state)
+
+            active_objects = {object_id: node for object_id, node in self.visual_graph_nodes.items() if node.get("active", False)}
+
+            # create edges
+            current_near_edges = set()
+            for (id_a, object_a), (id_b, object_b) in combinations(active_objects.items(), 2):
+                position_a = np.asarray(object_a["position_map"], dtype=np.float64)
+                position_b = np.asarray(object_b["position_map"], dtype=np.float64)
+
+                distance_m = float(np.linalg.norm(position_a - position_b))
+                proximity_threshold = 1.0 + float(object_a["radius_m"]) + float(object_b["radius_m"]) + float(object_a["position_uncertainty_m"]) + float(object_b["position_uncertainty_m"])
+                edge_key = (min(id_a, id_b), max(id_a, id_b), 'nearest')
+
+                if distance_m <= proximity_threshold:
+                    current_near_edges.add(edge_key)
+
+                    if edge_key not in self.visual_graph_edges:
+                        self.visual_graph_edges[edge_key] = {
+                            "source_id": edge_key[0],
+                            "target_id": edge_key[1],
+                            "type": "nearest",
+                            "distance_m": distance_m,
+                            "first_seen_ns": timestamp_ns,
+                            "last_seen_ns": timestamp_ns,
+                            "observation_count": 1,
+                            "active": True
+                        }
+                    else:
+                        edge = self.visual_graph_edges[edge_key]
+                        edge["distance_m"] = distance_m
+                        edge["last_seen_ns"] = timestamp_ns
+                        edge["observation_count"] += 1
+                        edge["active"] = True
+
+            # Deactivate nearest edges that are no longer present.
+            for edge_key, edge in self.visual_graph_edges.items():
+                if edge["type"] != "nearest":
+                    continue
+
+                if edge_key not in current_near_edges:
+                    edge["active"] = False
+
+            # create area edges
+            del active_objects
+            active_object_ids = {object_id for object_id, node in self.visual_graph_nodes.items() if node.get("active", False)}
+
+            # Every active object starts as an isolated graph node.
+            adjacency = {object_id: set() for object_id in active_object_ids}
+
+            # Add currently active NEAR relationships.
+            for edge in self.visual_graph_edges.values():
+                if edge.get("type") != "nearest": continue
+                if not edge.get("active", False): continue
+
+                source_id = edge["source_id"]
+                target_id = edge["target_id"]
+
+                if source_id not in active_object_ids or target_id not in active_object_ids:
+                    continue
+
+                adjacency[source_id].add(target_id)
+                adjacency[target_id].add(source_id)
+
+            # Find connected components.
+            components = []
+            unvisited = set(active_object_ids)
+
+            while unvisited:
+                start_id = unvisited.pop()
+                component = {start_id}
+                stack = [start_id]
+
+                while stack:
+                    current_id = stack.pop()
+
+                    for neighbour_id in adjacency[current_id]:
+                        if neighbour_id not in unvisited:
+                            continue
+
+                        unvisited.remove(neighbour_id)
+                        component.add(neighbour_id)
+                        stack.append(neighbour_id)
+
+                components.append(component)
+
+            # Larger components are matched first. This helps preserve
+            # stable area IDs when an area splits.
+            components.sort(key=len, reverse=True)
+            previous_areas = {area_id: set(area["member_ids"]) for area_id, area in self.visual_area_nodes.items() if area.get("active", False)}
+
+            # Match new components to old areas according to how many
+            # object IDs they have in common.
+            match_candidates = []
+
+            for component_index, component in enumerate(components):
+                for area_id, old_members in previous_areas.items():
+                    overlap = len(component.intersection(old_members))
+
+                    if overlap > 0:
+                        match_candidates.append((overlap, component_index, area_id))
+
+            match_candidates.sort(reverse=True)
+
+            component_to_area = {}
+            used_area_ids = set()
+
+            for overlap, component_index, area_id in match_candidates:
+                if component_index in component_to_area:
+                    continue
+
+                if area_id in used_area_ids:
+                    continue
+
+                component_to_area[component_index] = area_id
+                used_area_ids.add(area_id)
+
+            # Deactivate old areas. Matched areas are reactivated below.
+            for area in self.visual_area_nodes.values():
+                area["active"] = False
+
+            self.object_to_area.clear()
+
+            for area_edge in self.visual_area_edges.values():
+                area_edge["active"] = False
+
+            for component_index, member_ids in enumerate(components):
+                if component_index in component_to_area:
+                    area_id = component_to_area[component_index]
+                else:
+                    area_id = self.next_area_id
+                    self.next_area_id += 1
+
+                positions = np.array([self.visual_graph_nodes[object_id]["position_map"] for object_id in member_ids], dtype=np.float64)
+                centroid_map = np.mean(positions, axis=0)
+
+                if area_id not in self.visual_area_nodes:
+                    self.visual_area_nodes[area_id] = {
+                        "area_id": area_id,
+                        "member_ids": set(),
+                        "centroid_map": centroid_map,
+                        "first_seen_ns": timestamp_ns,
+                        "last_updated_ns": timestamp_ns,
+                        "active": True,
+                    }
+
+                area = self.visual_area_nodes[area_id]
+
+                area["member_ids"] = set(member_ids)
+                area["centroid_map"] = centroid_map
+                area["last_updated_ns"] = timestamp_ns
+                area["active"] = True
+
+                for object_id in member_ids:
+                    self.object_to_area[object_id] = area_id
+                    self.visual_graph_nodes[object_id]["area_id"] = area_id
+
+                    area_edge_key = (area_id, object_id, "area")
+
+                    if area_edge_key not in self.visual_area_edges:
+                        self.visual_area_edges[area_edge_key] = {
+                            "area_id": area_id,
+                            "object_id": object_id,
+                            "type": "area",
+                            "first_seen_ns": timestamp_ns,
+                            "last_updated_ns": timestamp_ns,
+                            "active": True,
+                        }
+                    else:
+                        area_edge = self.visual_area_edges[area_edge_key]
+                        area_edge["last_updated_ns"] = timestamp_ns
+                        area_edge["active"] = True
+
+            # visualize nearest object edges
+            marker = Marker()
+
+            marker.header.stamp = msg.header.stamp
+            marker.header.frame_id = msg.header.frame_id
+
+            marker.ns = "visual_graph_edges"
+            marker.id = 0
+            marker.type = Marker.LINE_LIST
+            marker.action = Marker.ADD
+
+            # Width of each line in metres.
+            marker.scale.x = 0.025
+
+            # Light cyan edge colour.
+            marker.color.r = 0.2
+            marker.color.g = 0.8
+            marker.color.b = 1.0
+            marker.color.a = 0.9
+
+            marker.pose.orientation.w = 1.0
+
+            for edge in self.visual_graph_edges.values():
+                if edge["type"] != "nearest":
+                    continue
+
+                if not edge["active"]:
+                    continue
+
+                source_id = edge["source_id"]
+                target_id = edge["target_id"]
+
+                source_node = self.visual_graph_nodes.get(source_id)
+                target_node = self.visual_graph_nodes.get(target_id)
+
+                if source_node is None or target_node is None: continue
+                if not source_node.get("active", False): continue
+                if not target_node.get("active", False): continue
+
+                source_position = source_node["position_map"]
+                target_position = target_node["position_map"]
+
+                source_point = Point()
+                source_point.x = float(source_position[0])
+                source_point.y = float(source_position[1])
+                source_point.z = float(source_position[2])
+
+                target_point = Point()
+                target_point.x = float(target_position[0])
+                target_point.y = float(target_position[1])
+                target_point.z = float(target_position[2])
+
+                marker.points.append(source_point)
+                marker.points.append(target_point)
+
+            if not marker.points:
+                # Remove the previously displayed edge marker when no active edges remain
+                marker.action = Marker.DELETE
+
+            # visualize area nodes
+            area_node_marker = Marker()
+
+            area_node_marker.header = msg.header
+            area_node_marker.ns = "visual_area_nodes"
+            area_node_marker.id = 0
+            area_node_marker.type = Marker.SPHERE_LIST
+            area_node_marker.action = Marker.ADD
+            area_node_marker.pose.orientation.w = 1.0
+
+            area_node_marker.scale.x = 0.35
+            area_node_marker.scale.y = 0.35
+            area_node_marker.scale.z = 0.35
+
+            area_node_marker.color.r = 1.0
+            area_node_marker.color.g = 0.2
+            area_node_marker.color.b = 0.2
+            area_node_marker.color.a = 1.0
+
+            for area in self.visual_area_nodes.values():
+                if not area["active"]:
+                    continue
+
+                position = area["centroid_map"]
+
+                point = Point()
+                point.x = float(position[0])
+                point.y = float(position[1])
+                point.z = float(position[2] + 1.5)
+
+                area_node_marker.points.append(point)
+
+            if not area_node_marker.points:
+                area_node_marker.action = Marker.DELETE
+
+            # visualize area egdes
+            area_edge_marker = Marker()
+
+            area_edge_marker.header = msg.header
+            area_edge_marker.ns = "visual_area_edges"
+            area_edge_marker.id = 0
+            area_edge_marker.type = Marker.LINE_LIST
+            area_edge_marker.action = Marker.ADD
+            area_edge_marker.pose.orientation.w = 1.0
+
+            area_edge_marker.scale.x = 0.04
+
+            # Orange area-membership edges.
+            area_edge_marker.color.r = 1.0
+            area_edge_marker.color.g = 0.5
+            area_edge_marker.color.b = 0.1
+            area_edge_marker.color.a = 0.9
+
+            for area_edge in self.visual_area_edges.values():
+                if not area_edge["active"]:
+                    continue
+
+                area = self.visual_area_nodes.get(area_edge["area_id"])
+                object_node = self.visual_graph_nodes.get(area_edge["object_id"])
+
+                if area is None or object_node is None: continue
+                if not area["active"]: continue
+                if not object_node.get("active", False): continue
+
+                area_position = area["centroid_map"]
+                object_position = object_node["position_map"]
+
+                area_point = Point()
+                area_point.x = float(area_position[0])
+                area_point.y = float(area_position[1])
+                area_point.z = float(area_position[2] + 1.5)
+
+                object_point = Point()
+                object_point.x = float(object_position[0])
+                object_point.y = float(object_position[1])
+                object_point.z = float(object_position[2])
+
+                area_edge_marker.points.append(area_point)
+                area_edge_marker.points.append(object_point)
+
+            if not area_edge_marker.points:
+                area_edge_marker.action = Marker.DELETE
+
+        self.visual_graph_edge_viz_pub.publish(marker)
+        self.visual_graph_edge_viz_pub.publish(area_edge_marker)
+        self.visual_graph_edge_viz_pub.publish(area_node_marker)
 
     def vo_callback(self, msg):
         timestamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -240,14 +567,14 @@ class AudioCLIPSub(Node):
 
             #     tstamp_ns = direction.stamp.sec * 1_000_000_000 + direction.stamp.nanosec
             #     with self.wo_lock:
-            #         world_object_ids = list(self.visual_graph.keys())
+            #         world_object_ids = list(self.visual_graph_nodes.keys())
 
             #     sst_candidate_objs = []
 
             #     for object_id in world_object_ids:
             #         state_history = None
             #         with self.wo_lock:
-            #             node = self.visual_graph[object_id]
+            #             node = self.visual_graph_nodes[object_id]
             #             if node is not None: state_history = node['state_history']
 
             #         state = None
@@ -353,6 +680,8 @@ class AudioCLIPSub(Node):
                     # format output strings
                     query = f'{audio_idx} ->\t'
                     results = ', '.join([f'{self.LABELS[i]:>5s} ({v:06.2%})' for v, i in zip(conf_values, ids)])
+
+                    # visualize classification results
                     text_marker = Marker()
                     text_marker.header = sss_header
                     text_marker.ns = "audioclip_class_text"
@@ -368,9 +697,9 @@ class AudioCLIPSub(Node):
 
                     text_marker.scale.z = 0.11
 
-                    text_marker.color.r = 0.98
-                    text_marker.color.g = 0.686
-                    text_marker.color.b = 0.361
+                    text_marker.color.r = 0.318
+                    text_marker.color.g = 0.749
+                    text_marker.color.b = 0.212
                     text_marker.color.a = 1.0
                     marker_array.markers.append(text_marker)
                     text_marker.text = f'{query + results}'
