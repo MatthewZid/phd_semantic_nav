@@ -70,7 +70,8 @@ class AudioCLIPSub(Node):
         self.aclp.eval()
         self.audio_transforms = ToTensor1D()
 
-        self.tf_buffer = tf2_ros.Buffer()
+        # self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=60.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=False)
 
         # self.position_clustering = HDBSCAN(min_cluster_size=2, metric='euclidean')
@@ -118,9 +119,13 @@ class AudioCLIPSub(Node):
         self.visual_area_edges = {}
         self.object_to_area = {}
         self.next_area_id = 0
+
+        self.audio_graph_nodes = {}
+        self.audio_node_id = 0
+        self.audio_obs_id = 0
+
         self.obs_cache = defaultdict(lambda: deque(maxlen=20)) # cache memory for recent visual observation messages
         self.wo_lock = threading.Lock()
-
 
         text = [[label] for label in self.LABELS]
         with torch.no_grad():
@@ -139,7 +144,8 @@ class AudioCLIPSub(Node):
         # self.test_audio_features = self.test_audio_features / torch.linalg.norm(self.test_audio_features, dim=-1, keepdim=True)
         # test audio end
 
-        self.sss_pub = self.create_publisher(MarkerArray, '/audioclip_cls', audio_qos)
+        self.sss_pub = self.create_publisher(MarkerArray, '/audio_graph/audioclip_cls', audio_qos)
+        self.audio_graph_viz_pub = self.create_publisher(MarkerArray, "/audio_graph/node_markers", 10)
 
         self.sss_sub = self.create_subscription(OdasOut, '/audioclip_sss', self.sss_callback, audio_qos)
         self.sss_sub  # prevent unused variable warning
@@ -240,7 +246,7 @@ class AudioCLIPSub(Node):
             # Every active object starts as an isolated graph node.
             adjacency = {object_id: set() for object_id in active_object_ids}
 
-            # Add currently active NEAR relationships.
+            # Add currently active nearest relationships.
             for edge in self.visual_graph_edges.values():
                 if edge.get("type") != "nearest": continue
                 if not edge.get("active", False): continue
@@ -533,13 +539,45 @@ class AudioCLIPSub(Node):
         # data = np.array(msg.data.data, dtype=np.float32).reshape((msg.data.layout.dim[0].size, msg.data.layout.dim[1].size))
         data_list = []
         metadata_list = []
+        audio_observations = []
 
         # associate world object (vision) with sound source direction (audio)
         for odas_sss_msg in msg.sources:
             audio_clip_candidates = {}
-            data_list.append(np.array(odas_sss_msg.data, dtype=np.float32))
-            metadata_list.append((odas_sss_msg.start, odas_sss_msg.end, odas_sss_msg.id, \
-                                  odas_sss_msg.channel_idx, odas_sss_msg.sample_rate, odas_sss_msg.frame_sample_count, odas_sss_msg.sst))
+            audio = np.array(odas_sss_msg.data, dtype=np.float32)
+            data_list.append(audio)
+            # metadata_list.append((odas_sss_msg.start, odas_sss_msg.end, odas_sss_msg.id, \
+            #                       odas_sss_msg.channel_idx, odas_sss_msg.sample_rate, odas_sss_msg.frame_sample_count, odas_sss_msg.sst))
+
+            source_directions = []
+            for sst in odas_sss_msg.sst:
+                direction = np.array([sst.x, sst.y, sst.z], dtype=np.float64)
+                norm = np.linalg.norm(direction)
+                if norm < 1e-9: continue
+                direction /= norm
+
+                source_directions.append({
+                    'timestamp_ns': int(sst.stamp.sec) * 1_000_000_000 + sst.stamp.nanosec,
+                    'direction_mic': direction,
+                    'activity': float(sst.activity)
+                })
+
+            audio_observations.append({
+                'audio_obs_id': self.audio_obs_id,
+                'odas_source_id': int(odas_sss_msg.id),
+                'channel_idx': int(odas_sss_msg.channel_idx),
+                'start_ns': int(odas_sss_msg.start.sec) * 1_000_000_000 + int(odas_sss_msg.start.nanosec),
+                'end_ns': int(odas_sss_msg.end.sec) * 1_000_000_000 + int(odas_sss_msg.end.nanosec),
+                'sample_rate': int(odas_sss_msg.sample_rate),
+                'duration_sec': float(audio.size) / float(odas_sss_msg.sample_rate),
+                'audio': audio.copy(),
+                'odas_directions': source_directions,
+                'audioclip_embeddings': None,
+                'label': '',
+                'label_confidence': None
+            })
+
+            self.audio_obs_id += 1
 
             # for direction in odas_sss_msg.sst:
             #     try:
@@ -627,10 +665,78 @@ class AudioCLIPSub(Node):
         # self.get_logger().info(f"\033[95mReceived std: {data.std():.6f}\033[0m")
         # self.get_logger().info(f"\033[95mReceived RMS: {np.sqrt(np.mean(data**2)):.6f}\033[0m")
         # self.get_logger().info(f"\033[95mReceived vals: {data[:, :5]}\033[0m")
-        self.audioclip_q.put((msg.header, data, metadata_list))
+        # self.audioclip_q.put((msg.header, data, metadata_list))
+        self.audioclip_q.put((msg.header, data, audio_observations))
         # for i in range(data.shape[0]):
         #     source = data[i].reshape(1, -1)
         #     self.audioclip_q.put((source, msg.sst, msg.i, msg.stride))
+    
+    def _evaluate_node(self, node, observation):
+        # calculate time difference between observation and node
+        elapsed_time = (int(observation["start_ns"]) - int(node["last_seen_ns"])) / 1e9 # in seconds
+
+        # ignore observations that hugely overlap the node or much older observations
+        if elapsed_time < -0.1:
+            self.get_logger().info(
+                f"Reject node {node['audio_node_id']}: "
+                f"overlap={elapsed_time:.3f}s"
+            )
+            return None
+        if elapsed_time > 10.0:
+            self.get_logger().info(
+                f"Reject node {node['audio_node_id']}: "
+                f"gap={elapsed_time:.3f}s"
+            )
+            return None
+
+        elapsed_time = max(0.0, elapsed_time)
+        time_cost = min(elapsed_time / 10.0, 1.0)   # time cost inside [0.0, 1.0]
+
+        # calculate cosine similarity between node and observation to identify graph existence
+        observation_norm = float(np.linalg.norm(observation['audioclip_embeddings']))
+        node_norm = float(np.linalg.norm(node["audioclip_embeddings"]))
+
+        if observation_norm < 1e-9 or node_norm < 1e-9:
+            return None
+
+        embedding_similarity = float(np.dot(observation['audioclip_embeddings'], node["audioclip_embeddings"]) / (observation_norm * node_norm))
+        embedding_similarity = float(np.clip(embedding_similarity, -1.0, 1.0))  # cosine similarity inside [-1.0, 1.0]
+
+        embedding_cost = (1.0 - embedding_similarity) / 2.0 # embedding cost inside [0.0, 1.0]
+
+        # label match
+        labels_match = observation["label"] == node["label"]
+        label_cost = 0.0 if labels_match else 1.0
+
+        # weighted total cost
+        cost = 0.7 * embedding_cost + 0.20 * time_cost + 0.10 * label_cost
+
+        return max(0.0, float(cost))
+
+    def create_new_node(self, observation):
+        accumulated_observations = deque(maxlen=5)
+        accumulated_observations.append(observation)
+
+        self.audio_graph_nodes[self.audio_node_id] = {
+            'audio_node_id': self.audio_node_id,
+            'audio_obs_id': observation['audio_obs_id'],
+            'odas_source_ids': {observation['odas_source_id']},
+            'latest_odas_source_id': observation['odas_source_id'],
+            'latest_channel_idx': observation['channel_idx'],
+            'first_seen_ns': observation['start_ns'],
+            'last_seen_ns': observation['end_ns'],
+            'sample_rate': observation['sample_rate'],
+            'duration_sec': observation['duration_sec'],
+            'odas_directions': observation['odas_directions'].copy(),
+            'audio': observation['audio'].copy(),
+            'audioclip_embeddings': observation['audioclip_embeddings'].copy(),
+            'label': str(observation['label']),
+            'label_confidence': observation['label_confidence'],
+            'active': True,
+            'past_observations': accumulated_observations
+        }
+
+        self.audio_node_id += 1
     
     def inference_thread(self):
         while rclpy.ok():
@@ -638,7 +744,7 @@ class AudioCLIPSub(Node):
             sstlist = []
 
             self.get_logger().info(f'Trying to get from queue...')
-            sss_header, data, metadata_list = self.audioclip_q.get()
+            sss_header, data, audio_observations = self.audioclip_q.get()
             audio = self.audio_transforms(data)
             
             try:
@@ -673,36 +779,110 @@ class AudioCLIPSub(Node):
                 source_counter = 0
                 marker_array = MarkerArray()
                 offset_text = 0.0
+                assigned_node_ids = []
+                batch_visited_nodes = set()
                 for audio_idx in range(audio_features.size(0)):
-                    # get top-3 most similar results
+                    # get top most similar results
                     conf_values, ids = confidence[audio_idx].topk(audio_features.size(0))
 
                     # format output strings
                     query = f'{audio_idx} ->\t'
                     results = ', '.join([f'{self.LABELS[i]:>5s} ({v:06.2%})' for v, i in zip(conf_values, ids)])
 
-                    # visualize classification results
-                    text_marker = Marker()
-                    text_marker.header = sss_header
-                    text_marker.ns = "audioclip_class_text"
-                    text_marker.id = audio_idx
-                    text_marker.type = Marker.TEXT_VIEW_FACING
-                    text_marker.action = Marker.ADD
+                    # update audio info
+                    audio_observations[audio_idx]['audioclip_embeddings'] = audio_features[audio_idx].detach().cpu().numpy().astype(np.float32)
+                    audio_observations[audio_idx]['label'] = str(self.LABELS[ids[0]])
+                    audio_observations[audio_idx]['label_confidence'] = float(conf_values[0])
 
-                    text_marker.pose.position.x = float(offset_text)
-                    text_marker.pose.position.y = float(offset_text)
-                    text_marker.pose.position.z = float(offset_text)
-                    text_marker.pose.orientation.w = 1.0
-                    offset_text -= 0.1
+                    # create or update audio graph node
+                    best_node_id = None
+                    # best_cost = float('inf')
+                    best_cost = 0.3
 
-                    text_marker.scale.z = 0.11
+                    candidate_costs = {}
+                    rejected_node_ids = []
+                    excluded_node_ids = []
+                    for audio_node_id, node in self.audio_graph_nodes.items():
+                        if audio_node_id in batch_visited_nodes:
+                            excluded_node_ids.append(audio_node_id)
+                            continue
 
-                    text_marker.color.r = 0.318
-                    text_marker.color.g = 0.749
-                    text_marker.color.b = 0.212
-                    text_marker.color.a = 1.0
-                    marker_array.markers.append(text_marker)
-                    text_marker.text = f'{query + results}'
+                        # check if the audio observation matches any saved node with certain criteria
+                        cost = self._evaluate_node(node, audio_observations[audio_idx])
+
+                        if cost is None:
+                            rejected_node_ids.append(audio_node_id)
+                            continue
+                        candidate_costs[audio_node_id] = cost
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_node_id = audio_node_id
+
+                    audio_node_id = -1
+                    if best_node_id is None:
+                        # create new node
+                        audio_node_id = int(self.audio_node_id)
+                        self.create_new_node(audio_observations[audio_idx])
+
+                        self.get_logger().warning(
+                            f"Creating new audio node: "
+                            f"obs={audio_observations[audio_idx]['audio_obs_id']}, "
+                            f"label={audio_observations[audio_idx]['label']}, "
+                            f"ODAS={audio_observations[audio_idx]['odas_source_id']}, "
+                            f"candidate_costs={candidate_costs}, "
+                            f"rejected={rejected_node_ids}, "
+                            f"batch_excluded={excluded_node_ids}, "
+                            f"new_node_cost={best_cost:.3f}"
+                        )
+                    else:
+                        # update existing node
+                        audio_node_id = int(best_node_id)
+                        node = self.audio_graph_nodes[audio_node_id]
+
+                        node['audio_obs_id'] = int(audio_observations[audio_idx]['audio_obs_id'])
+                        node['odas_source_ids'].add(audio_observations[audio_idx]['odas_source_id'])
+                        node['latest_odas_source_id'] = audio_observations[audio_idx]['odas_source_id']
+                        node['latest_channel_idx'] = audio_observations[audio_idx]['channel_idx']
+                        node['last_seen_ns'] = audio_observations[audio_idx]['end_ns']
+                        node['sample_rate'] = audio_observations[audio_idx]['sample_rate']
+                        node['duration_sec'] = audio_observations[audio_idx]['duration_sec']
+                        node['odas_directions'] = audio_observations[audio_idx]['odas_directions'].copy()
+                        node['audio'] = audio_observations[audio_idx]['audio'].copy()
+                        node['audioclip_embeddings'] = audio_observations[audio_idx]['audioclip_embeddings'].copy()
+                        node['label'] = str(audio_observations[audio_idx]['label'])
+                        node['label_confidence'] = audio_observations[audio_idx]['label_confidence']
+                        node['active'] = True
+                        node['past_observations'].append(audio_observations[audio_idx])
+
+                    audio_observations[audio_idx]['audio_node_id'] = int(audio_node_id)
+                    assigned_node_ids.append(audio_node_id)
+                    batch_visited_nodes.add(audio_node_id)
+
+                    # TODO: associate audio nodes to visual nodes
+
+                    # visualize classification results (temporarily before creating and visualizing audio graph nodes)
+                    # text_marker = Marker()
+                    # text_marker.header = sss_header
+                    # text_marker.ns = "audioclip_class_text"
+                    # text_marker.id = audio_idx
+                    # text_marker.type = Marker.TEXT_VIEW_FACING
+                    # text_marker.action = Marker.ADD
+
+                    # text_marker.pose.position.x = float(offset_text)
+                    # text_marker.pose.position.y = float(offset_text)
+                    # text_marker.pose.position.z = float(offset_text)
+                    # text_marker.pose.orientation.w = 1.0
+                    # offset_text -= 0.1
+
+                    # text_marker.scale.z = 0.11
+
+                    # text_marker.color.r = 0.318
+                    # text_marker.color.g = 0.749
+                    # text_marker.color.b = 0.212
+                    # text_marker.color.a = 1.0
+                    # text_marker.text = f'{query + results}'
+                    # marker_array.markers.append(text_marker)
+
                     # sf.write(f'/ros2_ws/src/phd_semantic_nav/phd_semantic_nav/audio_out_samples/out_{nanosec}_{source_counter}.wav', audio[audio_idx, 0].numpy(), 44100)
                     # avg_activity = 0.0
                     # for element in sstlist[0][0][source_counter:source_counter + sstlist[0][2][audio_idx]]:
@@ -717,7 +897,118 @@ class AudioCLIPSub(Node):
                     source_counter += 1
                     # source_counter += sstlist[0][2][audio_idx]
                 
-                self.sss_pub.publish(marker_array)
+                # visualize audio graph nodes (for now, only for a fixed position in map along the sst direction)
+                self.get_logger().info(f"Audio nodes: {len(list(self.audio_graph_nodes.values()))}")
+                audio_graph_marker_array = MarkerArray()
+
+                # clear the previous audio graph visualization
+                delete_marker = Marker()
+                delete_marker.header.stamp = sss_header.stamp
+                delete_marker.header.frame_id = "walp/map"
+                delete_marker.action = Marker.DELETEALL
+                audio_graph_marker_array.markers.append(delete_marker)
+
+                for node in self.audio_graph_nodes.values():
+                    if not node.get("active", False): continue
+
+                    directions = node.get('odas_directions', [])
+                    if not directions: continue
+
+                    # use midpoint of the direction list
+                    direction_state = directions[len(directions) // 2]
+
+                    timestamp_ns = int(direction_state["timestamp_ns"])
+                    direction_mic = np.asarray(direction_state["direction_mic"], dtype=np.float64).copy()
+                    direction_norm = float(np.linalg.norm(direction_mic))
+
+                    if direction_norm < 1e-9: continue
+                    direction_mic /= direction_norm
+
+                    try:
+                        mic_to_map = self.tf_buffer.lookup_transform(
+                            "walp/map",
+                            "box_mic",
+                            Time(nanoseconds=timestamp_ns),
+                            timeout=Duration(seconds=0.1)
+                        )
+                    except tf2_ros.TransformException as error:
+                        self.get_logger().warning(f"Cannot visualize audio node {node['audio_node_id']}: {error}")
+                        continue
+
+                    translation = mic_to_map.transform.translation
+                    mic_position_map = np.array([translation.x, translation.y, translation.z], dtype=np.float64)
+                    rotation_matrix = self.quaternion_to_rotation_matrix(mic_to_map.transform.rotation)
+
+                    # rotate to map frame
+                    direction_map = rotation_matrix @ direction_mic
+                    map_direction_norm = float(np.linalg.norm(direction_map))
+
+                    if map_direction_norm < 1e-9: continue
+
+                    direction_map /= map_direction_norm
+
+                    # fixed marker position since audio not yet matched with a visual object
+                    display_position_map = mic_position_map + direction_map
+                    audio_node_id = int(node["audio_node_id"])
+
+                    # audio node marker
+                    node_marker = Marker()
+                    node_marker.header.stamp = sss_header.stamp
+                    node_marker.header.frame_id = "walp/map"
+                    node_marker.ns = "audio_graph_nodes"
+                    node_marker.id = audio_node_id
+                    node_marker.type = Marker.SPHERE
+                    node_marker.action = Marker.ADD
+
+                    node_marker.pose.position.x = float(display_position_map[0])
+                    node_marker.pose.position.y = float(display_position_map[1])
+                    node_marker.pose.position.z = float(display_position_map[2] + 1.5)
+                    node_marker.pose.orientation.w = 1.0
+
+                    node_marker.scale.x = 0.30
+                    node_marker.scale.y = 0.30
+                    node_marker.scale.z = 0.30
+
+                    node_marker.color.r = 0.95
+                    node_marker.color.g = 0.20
+                    node_marker.color.b = 0.75
+                    node_marker.color.a = 1.0
+
+                    audio_graph_marker_array.markers.append(node_marker)
+
+                    # audio node text
+                    text_marker = Marker()
+                    text_marker.header.stamp = sss_header.stamp
+                    text_marker.header.frame_id = "walp/map"
+                    text_marker.ns = "audio_graph_node_text"
+                    text_marker.id = audio_node_id
+                    text_marker.type = Marker.TEXT_VIEW_FACING
+                    text_marker.action = Marker.ADD
+
+                    text_marker.pose.position.x = float(display_position_map[0])
+                    text_marker.pose.position.y = float(display_position_map[1])
+                    text_marker.pose.position.z = float(display_position_map[2] + 1.5 + 0.3)
+                    text_marker.pose.orientation.w = 1.0
+
+                    text_marker.scale.z = 0.16
+
+                    text_marker.color.r = 0.318
+                    text_marker.color.g = 0.749
+                    text_marker.color.b = 0.212
+                    text_marker.color.a = 1.0
+
+                    source_ids_text = ",".join(str(source_id) for source_id in sorted(node["odas_source_ids"]))
+
+                    text_marker.text = (
+                        f"{node['label']}\n"
+                        f"{float(node['label_confidence']):.2f}\n"
+                        f"ODAS IDs={source_ids_text}"
+                    )
+
+                    audio_graph_marker_array.markers.append(text_marker)
+
+                self.audio_graph_viz_pub.publish(audio_graph_marker_array)
+                # self.sss_pub.publish(marker_array)
 
                 # if audio_features.size(0) > 1:
                 #     distances = cosine_similarity(audio_features.numpy())
