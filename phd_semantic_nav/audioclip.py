@@ -737,6 +737,24 @@ class AudioCLIPSub(Node):
         }
 
         self.audio_node_id += 1
+
+    def mark_audio_node_activity(self, current_audio_time_ns):
+        INACTIVITY_TIMEOUT = 6.0
+        DELETION_TIMEOUT = 15.0
+
+        inactive_timeout_ns = int(INACTIVITY_TIMEOUT * 1e9)
+        deletion_timeout_ns = int(DELETION_TIMEOUT * 1e9)
+        nodes_to_delete = []
+
+        for audio_node_id, node in self.audio_graph_nodes.items():
+            time_since_last_seen_ns = max(0, int(current_audio_time_ns) - int(node["last_seen_ns"]))
+            node["active"] = time_since_last_seen_ns <= inactive_timeout_ns
+
+            # if time_since_last_seen_ns > deletion_timeout_ns:
+            #     nodes_to_delete.append(audio_node_id)
+
+        for audio_node_id in nodes_to_delete:
+            del self.audio_graph_nodes[audio_node_id]
     
     def inference_thread(self):
         while rclpy.ok():
@@ -897,6 +915,11 @@ class AudioCLIPSub(Node):
                     source_counter += 1
                     # source_counter += sstlist[0][2][audio_idx]
                 
+                # check if sound sources are still active
+                if audio_observations:
+                    current_audio_time_ns = max(int(observation["end_ns"]) for observation in audio_observations)
+                    self.mark_audio_node_activity(current_audio_time_ns)
+
                 # visualize audio graph nodes (for now, only for a fixed position in map along the sst direction)
                 self.get_logger().info(f"Audio nodes: {len(list(self.audio_graph_nodes.values()))}")
                 audio_graph_marker_array = MarkerArray()
