@@ -9,6 +9,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration
 from rclpy.time import Time
 import torch
+import cv2
+from PIL import Image
 import os
 import sys
 from ament_index_python.packages import get_package_share_directory
@@ -34,6 +36,15 @@ from collections import defaultdict, deque
 from visualization_msgs.msg import Marker, MarkerArray
 from itertools import combinations
 from geometry_msgs.msg import Point
+
+from torchvision.transforms import (
+    Compose,
+    Resize,
+    CenterCrop,
+    ToTensor,
+    Normalize,
+    InterpolationMode,
+)
 
 torch.set_grad_enabled(False)
 # torch.set_num_threads(2)  # Give PyTorch 2 dedicated cores for efficient matrix batching
@@ -69,6 +80,17 @@ class AudioCLIPSub(Node):
         self.aclp = AudioCLIP(pretrained=f'{audioclip_path}/assets/AudioCLIP-Full-Training.pt')
         self.aclp.eval()
         self.audio_transforms = ToTensor1D()
+
+        self.image_transforms = Compose([
+            Resize(224, interpolation=InterpolationMode.BICUBIC),
+            CenterCrop(224),
+            lambda image: image.convert("RGB"),
+            ToTensor(),
+            Normalize(
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711),
+            ),
+        ])
 
         # self.tf_buffer = tf2_ros.Buffer()
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=60.0))
@@ -113,19 +135,44 @@ class AudioCLIPSub(Node):
             'alarm clock'
         ]
 
-        self.visual_graph_nodes = {}  # 3DSG-like structure (only nodes for now)
+        # 3DSG
+        self.visual_graph_nodes = {}  # 3DSG-like structure
         self.visual_graph_edges = {}
         self.visual_area_nodes = {}
         self.visual_area_edges = {}
         self.object_to_area = {}
         self.next_area_id = 0
 
+        # Audio graph
         self.audio_graph_nodes = {}
         self.audio_node_id = 0
         self.audio_obs_id = 0
 
+        # Audio-visual node association edges
+        self.audio_visual_edges = {}
+
+        self.sst_cone_half_angle_deg = 15.0
+        self.visual_state_maximum_age_s = 5.0
+        self.visual_state_future_tolerance_s = 0.1
+        self.maximum_sst_samples_per_clip = 40
+
+        self.minimum_geometry_test_count = 3
+        self.minimum_geometry_match_ratio = 0.3
+
+        # self.maximum_crop_time_difference_s = 1.0
+        self.maximum_crop_time_difference_s = 5.0
+
+        # Initial semantic verification parameters (must be tweaked accordingly)
+        self.minimum_audio_image_similarity = 0.14
+        self.minimum_audio_image_margin = 0.02
+
+        self.minimum_edge_support_count = 2
+        self.minimum_edge_support_ratio = 0.6
+        self.odas_source_id_priority_timeout_s = 6.0
+
         self.obs_cache = defaultdict(lambda: deque(maxlen=20)) # cache memory for recent visual observation messages
         self.wo_lock = threading.Lock()
+        self.obs_lock = threading.Lock()
 
         text = [[label] for label in self.LABELS]
         with torch.no_grad():
@@ -518,21 +565,22 @@ class AudioCLIPSub(Node):
     def vo_callback(self, msg):
         timestamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
-        for obs in msg.observations:
-            object_id = int(obs.world_object_id)
+        with self.obs_lock:
+            for obs in msg.observations:
+                object_id = int(obs.world_object_id)
 
-            self.obs_cache[object_id].append({
-                'timestamp_ns': timestamp_ns,
-                'has_track_id': obs.has_track_id,
-                'track_id': int(obs.track_id),
-                'label': obs.label,
-                'class_id': obs.class_id,
-                'confidence': obs.confidence,
-                'bbox_xyxy': list(obs.bbox_xyxy),
-                'image_width': obs.image_width,
-                'image_height': obs.image_height,
-                'crop': obs.crop
-            })
+                self.obs_cache[object_id].append({
+                    'timestamp_ns': timestamp_ns,
+                    'has_track_id': obs.has_track_id,
+                    'track_id': int(obs.track_id),
+                    'label': obs.label,
+                    'class_id': obs.class_id,
+                    'confidence': obs.confidence,
+                    'bbox_xyxy': list(obs.bbox_xyxy),
+                    'image_width': obs.image_width,
+                    'image_height': obs.image_height,
+                    'crop': obs.crop
+                })
     
     def sss_callback(self, msg):
         self.get_logger().info(f'Placing in queue..')
@@ -578,78 +626,6 @@ class AudioCLIPSub(Node):
             })
 
             self.audio_obs_id += 1
-
-            # for direction in odas_sss_msg.sst:
-            #     try:
-            #         mic_to_map = self.tf_buffer.lookup_transform(
-            #             'walp/map',
-            #             'box_mic',
-            #             Time.from_msg(direction.stamp),
-            #             timeout=Duration(seconds=0.1)
-            #         )
-            #     except tf2_ros.TransformException as e:
-            #         self.get_logger().warning(f"Cannot transform box_mic into walp/map: {e}")
-            #         continue
-
-            #     translation = mic_to_map.transform.translation
-            #     rotation_matrix = self.quaternion_to_rotation_matrix(mic_to_map.transform.rotation)
-
-            #     mic_direction = np.array([direction.x, direction.y, direction.z], dtype=np.float64)
-            #     direction_norm = np.linalg.norm(mic_direction)
-            #     if direction_norm < 1e-9: continue
-            #     mic_direction /= direction_norm
-
-            #     mic_position_map = np.array([translation.x, translation.y, translation.z], dtype=np.float64)
-            #     direction_map = rotation_matrix @ mic_direction
-            #     direction_map /= np.linalg.norm(direction_map)
-
-            #     tstamp_ns = direction.stamp.sec * 1_000_000_000 + direction.stamp.nanosec
-            #     with self.wo_lock:
-            #         world_object_ids = list(self.visual_graph_nodes.keys())
-
-            #     sst_candidate_objs = []
-
-            #     for object_id in world_object_ids:
-            #         state_history = None
-            #         with self.wo_lock:
-            #             node = self.visual_graph_nodes[object_id]
-            #             if node is not None: state_history = node['state_history']
-
-            #         state = None
-            #         if state_history:
-            #             previous_states = [pstate for pstate in state_history if pstate['timestamp_ns'] <= tstamp_ns]
-            #             if previous_states:
-            #                 state = max(previous_states, key=lambda item: item['timestamp_ns'])
-            #             else:
-            #                 nearest_state = min(state_history, key=lambda item: item['timestamp_ns'])
-            #                 time_diff = nearest_state['timestamp_ns'] - tstamp_ns
-
-            #                 if time_diff >= 0 and time_diff <= 100_000_000:
-            #                     state = nearest_state
-
-            #         if state is None: continue
-                    
-            #         mic_to_object = state['position_map'] - mic_position_map
-            #         forward_distance = float(np.dot(mic_to_object, direction_map))    # projection of sound source to graph object along the sst direction
-                    
-            #         if forward_distance <= 0.0: continue  # if the dot product is <= 0, it lies in the opposite direction of the sst line
-                    
-            #         closest_point_map = mic_position_map + forward_distance * direction_map
-            #         perpendicular_distance = float(np.linalg.norm(state['position_map'] - closest_point_map))
-            #         cone_radius = forward_distance * np.tan(np.deg2rad(15.0)) # 15 degrees angles of cone search radius
-            #         allowed_distance = cone_radius + float(state["radius_m"]) + float(state["uncertainty_m"])  # include visual position uncertainty
-
-            #         # cone search
-            #         if perpendicular_distance <= allowed_distance:
-            #             sst_candidate_objs.append({
-            #                 'id': direction.id,
-            #                 'timestamp_ns': tstamp_ns,
-            #                 'world_object_id': object_id,
-            #                 'forward_distance_m': forward_distance,
-            #                 'perpendicular_distance_m': perpendicular_distance,
-            #                 'cone_radius_m': cone_radius,
-            #                 'allowed_distance_m': allowed_distance
-            #             })
 
         # proceed with semantic similarity
         data = np.stack(data_list, axis=0, dtype=np.float32)
@@ -709,18 +685,21 @@ class AudioCLIPSub(Node):
         label_cost = 0.0 if labels_match else 1.0
 
         # weighted total cost
-        cost = 0.7 * embedding_cost + 0.20 * time_cost + 0.10 * label_cost
+        cost = 0.7 * embedding_cost + 0.2 * time_cost + 0.1 * label_cost
 
         return max(0.0, float(cost))
 
     def create_new_node(self, observation):
         accumulated_observations = deque(maxlen=5)
-        accumulated_observations.append(observation)
+        # accumulated_observations.append(observation)
 
         self.audio_graph_nodes[self.audio_node_id] = {
             'audio_node_id': self.audio_node_id,
             'audio_obs_id': observation['audio_obs_id'],
             'odas_source_ids': {observation['odas_source_id']},
+            'odas_source_last_seen_ns': {
+                int(observation['odas_source_id']): int(observation['end_ns'])
+            },
             'latest_odas_source_id': observation['odas_source_id'],
             'latest_channel_idx': observation['channel_idx'],
             'first_seen_ns': observation['start_ns'],
@@ -732,8 +711,17 @@ class AudioCLIPSub(Node):
             'audioclip_embeddings': observation['audioclip_embeddings'].copy(),
             'label': str(observation['label']),
             'label_confidence': observation['label_confidence'],
+            'label_scores': {
+                str(observation['label']): float(observation['label_confidence'])
+            },
+            'latest_visual_grounding_status': 'unobserved',
+            'consecutive_visual_misses': 0,
             'active': True,
-            'past_observations': accumulated_observations
+            'past_observations': accumulated_observations,
+            'latest_visual_candidates': [],
+            'associated_world_object_id': None,
+            'visual_grounding_status': 'unobserved',
+            'candidate_history': deque(maxlen=10)
         }
 
         self.audio_node_id += 1
@@ -820,21 +808,63 @@ class AudioCLIPSub(Node):
                     candidate_costs = {}
                     rejected_node_ids = []
                     excluded_node_ids = []
-                    for audio_node_id, node in self.audio_graph_nodes.items():
-                        if audio_node_id in batch_visited_nodes:
-                            excluded_node_ids.append(audio_node_id)
+                    available_nodes = []
+
+                    for candidate_node_id, node in self.audio_graph_nodes.items():
+                        if candidate_node_id in batch_visited_nodes:
+                            excluded_node_ids.append(candidate_node_id)
                             continue
 
-                        # check if the audio observation matches any saved node with certain criteria
+                        available_nodes.append((candidate_node_id, node))
+
+                    observation_source_id = int(audio_observations[audio_idx]["odas_source_id"])
+                    observation_channel = int(audio_observations[audio_idx]["channel_idx"])
+                    observation_end_ns = int(audio_observations[audio_idx]["end_ns"])
+
+                    source_id_priority_timeout_ns = int(self.odas_source_id_priority_timeout_s * 1e9)
+                    source_id_nodes = []
+
+                    for candidate_node_id, node in available_nodes:
+                        source_last_seen_ns = node.get("odas_source_last_seen_ns", {}).get(observation_source_id)
+
+                        if source_last_seen_ns is None: continue
+
+                        source_id_age_ns = observation_end_ns - int(source_last_seen_ns)
+
+                        # Reject an ID recorded in the future, which would indicate
+                        # out-of-order observations, and reject an old ID that ODAS
+                        # may have reassigned to another source.
+                        if 0 <= source_id_age_ns <= source_id_priority_timeout_ns:
+                            source_id_nodes.append((candidate_node_id, node))
+
+                    channel_nodes = [(candidate_node_id, node) for candidate_node_id, node in available_nodes if int(node["latest_channel_idx"]) == observation_channel]
+
+                    if source_id_nodes:
+                        candidate_pool = source_id_nodes
+                        association_mode = "odas_source_id"
+
+                    elif channel_nodes:
+                        candidate_pool = channel_nodes
+                        association_mode = "channel_continuity"
+
+                    else:
+                        candidate_pool = available_nodes
+                        association_mode = "embedding_fallback"
+
+                    best_node_id = None
+                    best_cost = 0.3
+
+                    for candidate_node_id, node in candidate_pool:
                         cost = self._evaluate_node(node, audio_observations[audio_idx])
 
                         if cost is None:
-                            rejected_node_ids.append(audio_node_id)
+                            rejected_node_ids.append(candidate_node_id)
                             continue
-                        candidate_costs[audio_node_id] = cost
+                        candidate_costs[candidate_node_id] = cost
+
                         if cost < best_cost:
                             best_cost = cost
-                            best_node_id = audio_node_id
+                            best_node_id = candidate_node_id
 
                     audio_node_id = -1
                     if best_node_id is None:
@@ -857,9 +887,30 @@ class AudioCLIPSub(Node):
                         audio_node_id = int(best_node_id)
                         node = self.audio_graph_nodes[audio_node_id]
 
+                        observed_label = str(audio_observations[audio_idx]['label'])
+                        observed_confidence = float(audio_observations[audio_idx]['label_confidence'])
+
+                        node['label_scores'][observed_label] = node['label_scores'].get(observed_label, 0.0) + observed_confidence
+                        node['label'] = max(node['label_scores'], key=node['label_scores'].get)
+
+                        total_label_score = sum(node['label_scores'].values())
+
+                        node['label_confidence'] = node['label_scores'][node['label']] / max(total_label_score, 1e-9)
                         node['audio_obs_id'] = int(audio_observations[audio_idx]['audio_obs_id'])
-                        node['odas_source_ids'].add(audio_observations[audio_idx]['odas_source_id'])
-                        node['latest_odas_source_id'] = audio_observations[audio_idx]['odas_source_id']
+
+                        current_source_id = int(audio_observations[audio_idx]["odas_source_id"])
+                        current_observation_end_ns = int(audio_observations[audio_idx]["end_ns"])
+
+                        node["odas_source_ids"].add(current_source_id)
+                        node["odas_source_last_seen_ns"][current_source_id] = current_observation_end_ns
+                        node["latest_odas_source_id"] = current_source_id
+
+                        source_id_cutoff_ns = current_observation_end_ns - int(self.odas_source_id_priority_timeout_s * 1e9)
+
+                        for stored_source_id, last_seen_ns in list(node["odas_source_last_seen_ns"].items()):
+                            if int(last_seen_ns) < source_id_cutoff_ns:
+                                del node["odas_source_last_seen_ns"][stored_source_id]
+                        
                         node['latest_channel_idx'] = audio_observations[audio_idx]['channel_idx']
                         node['last_seen_ns'] = audio_observations[audio_idx]['end_ns']
                         node['sample_rate'] = audio_observations[audio_idx]['sample_rate']
@@ -867,17 +918,517 @@ class AudioCLIPSub(Node):
                         node['odas_directions'] = audio_observations[audio_idx]['odas_directions'].copy()
                         node['audio'] = audio_observations[audio_idx]['audio'].copy()
                         node['audioclip_embeddings'] = audio_observations[audio_idx]['audioclip_embeddings'].copy()
-                        node['label'] = str(audio_observations[audio_idx]['label'])
-                        node['label_confidence'] = audio_observations[audio_idx]['label_confidence']
+                        # node['label'] = str(audio_observations[audio_idx]['label'])
+                        # node['label_confidence'] = audio_observations[audio_idx]['label_confidence']
                         node['active'] = True
-                        node['past_observations'].append(audio_observations[audio_idx])
+                        # node['past_observations'].append(audio_observations[audio_idx])
 
                     audio_observations[audio_idx]['audio_node_id'] = int(audio_node_id)
                     assigned_node_ids.append(audio_node_id)
                     batch_visited_nodes.add(audio_node_id)
 
                     # TODO: associate audio nodes to visual nodes
+                    # Get geometrically feasible visual candidates that fall inside the sound direction cone
+                    directions = audio_observations[audio_idx].get('odas_directions', [])
 
+                    geometry_stats = {
+                        'direction_count': len(directions),
+                        'sampled_direction_count': 0,
+                        'invalid_directions': 0,
+                        'tf_failures': 0,
+                        'missing_visual_states': 0,
+                        'tested_object_states': 0,
+                        'behind_direction': 0,
+                        'outside_cone': 0,
+                        'inside_cone': 0,
+                        'insufficient_support': 0
+                    }
+
+                    visual_candidates = []
+                    closest_object_debug = None
+
+                    if directions:
+                        with self.wo_lock:
+                            visual_histories = {
+                                int(object_id): [
+                                    {
+                                        'timestamp_ns': int(state['timestamp_ns']),
+                                        'position_map': np.asarray(state['position_map'], dtype=np.float64).copy(),
+                                        'velocity_map': np.asarray(state['velocity_map'], dtype=np.float64).copy(),
+                                        'radius_m': float(state['radius_m']),
+                                        'position_uncertainty_m': float(state['position_uncertainty_m']),
+                                        'active': bool(state['active']),
+                                    }
+                                    for state in node['state_history']
+                                ]
+                                for object_id, node in self.visual_graph_nodes.items()
+                            }
+
+                        if visual_histories:
+                            if len(directions) > self.maximum_sst_samples_per_clip:
+                                sampled_indices = np.linspace(0, len(directions) - 1, self.maximum_sst_samples_per_clip, dtype=np.int64)
+                                directions = [directions[int(index)] for index in sampled_indices]
+                                geometry_stats['sampled_direction_count'] = len(directions)
+
+                            object_stats = {
+                                object_id: {
+                                    'world_object_id': object_id,
+                                    'tested_count': 0,
+                                    'match_count': 0,
+                                    'angles_deg': [],
+                                    'perpendicular_distances_m': [],
+                                    'forward_distances_m': [],
+                                    'activities': [],
+                                    'best_normalized_distance': float('inf'),
+                                    'best_match_timestamp_ns': None,
+                                }
+                                for object_id in visual_histories
+                            }
+
+                            cone_angle_rad = np.deg2rad(self.sst_cone_half_angle_deg)
+
+                            for direction_state in directions:
+                                timestamp_ns = int(direction_state["timestamp_ns"])
+                                direction_mic = np.asarray(direction_state["direction_mic"], dtype=np.float64)
+                                direction_norm = np.linalg.norm(direction_mic)
+
+                                if direction_norm < 1e-9:
+                                    geometry_stats['invalid_directions'] += 1
+                                    continue
+
+                                direction_mic /= direction_norm
+
+                                try:
+                                    mic_to_map = self.tf_buffer.lookup_transform(
+                                        "walp/map",
+                                        "box_mic",
+                                        Time(nanoseconds=timestamp_ns),
+                                        timeout=Duration(seconds=0.1),
+                                    )
+                                except tf2_ros.TransformException:
+                                    geometry_stats['tf_failures'] += 1
+                                    continue
+
+                                translation = mic_to_map.transform.translation
+                                mic_position_map = np.array([translation.x, translation.y, translation.z], dtype=np.float64)
+                                rotation_matrix = self.quaternion_to_rotation_matrix(mic_to_map.transform.rotation)
+
+                                direction_map = rotation_matrix @ direction_mic
+                                direction_map_norm = np.linalg.norm(direction_map)
+
+                                if direction_map_norm < 1e-9:
+                                    geometry_stats['invalid_directions'] += 1
+                                    continue
+
+                                direction_map /= direction_map_norm
+
+                                for object_id, state_history in visual_histories.items():
+                                    state = None
+                                    if not state_history: continue
+
+                                    maximum_age_ns = int(self.visual_state_maximum_age_s * 1e9)
+                                    future_tolerance_ns = int(self.visual_state_future_tolerance_s * 1e9)
+                                    previous_states = [prev_state for prev_state in state_history if int(prev_state['timestamp_ns']) <= int(timestamp_ns)]
+
+                                    if previous_states:
+                                        selected_state = max(previous_states, key=lambda previous_state: int(previous_state['timestamp_ns']))
+
+                                        age_ns = int(timestamp_ns) - int(selected_state['timestamp_ns'])
+
+                                        if age_ns <= maximum_age_ns:
+                                            state = selected_state
+
+                                    if state is None:
+                                        future_states = [future_state for future_state in state_history if 0 <= (int(future_state['timestamp_ns']) - int(timestamp_ns)) <= future_tolerance_ns]
+
+                                        if future_states:
+                                            state = min(future_states, key=lambda future_state: int(future_state['timestamp_ns']))
+
+                                    if state is None:
+                                        geometry_stats['missing_visual_states'] += 1
+                                        continue
+
+                                    geometry_stats['tested_object_states'] += 1
+
+                                    candidate_stats = object_stats[object_id]
+                                    candidate_stats['tested_count'] += 1
+
+                                    object_position_map = state['position_map']
+                                    mic_to_object = object_position_map - mic_position_map
+                                    object_distance = float(np.linalg.norm(mic_to_object))
+
+                                    if object_distance < 1e-9: continue
+
+                                    object_direction_map = mic_to_object / object_distance
+                                    direction_cosine = float(np.clip(np.dot(object_direction_map, direction_map), -1.0, 1.0))
+                                    full_angle_deg = float(np.degrees(np.arccos(direction_cosine)))
+
+                                    forward_distance = float(np.dot(mic_to_object, direction_map))  # calculate the directions between the visual object and audio
+                                    closest_point_map =  mic_position_map + forward_distance * direction_map
+                                    perpendicular_distance = float(np.linalg.norm(object_position_map - closest_point_map))
+                                    diagnostic_cone_radius = max(0.0, forward_distance * np.tan(cone_angle_rad))
+                                    diagnostic_allowed_distance = diagnostic_cone_radius + float(state['radius_m']) + float(state['position_uncertainty_m'])
+
+                                    if closest_object_debug is None or full_angle_deg < closest_object_debug['angle_deg']:
+                                        closest_object_debug = {
+                                            'world_object_id': int(object_id),
+                                            'direction_timestamp_ns': int(timestamp_ns),
+                                            'angle_deg': full_angle_deg,
+                                            'object_distance_m': object_distance,
+                                            'forward_distance_m': forward_distance,
+                                            'perpendicular_distance_m': perpendicular_distance,
+                                            'allowed_distance_m': diagnostic_allowed_distance,
+                                        }
+                                    
+                                    if forward_distance <= 0.0:
+                                        geometry_stats['behind_direction'] += 1
+                                        continue    # reject opposite vectors
+
+                                    # closest_point_map = mic_position_map + forward_distance * direction_map
+                                    # perpendicular_distance = float(np.linalg.norm(object_position_map - closest_point_map))
+
+                                    # cone check
+                                    cone_radius = forward_distance * np.tan(cone_angle_rad)
+                                    allowed_distance = cone_radius + float(state['radius_m']) + float(state['position_uncertainty_m'])
+
+                                    if perpendicular_distance > allowed_distance:
+                                        geometry_stats['outside_cone'] += 1
+                                        continue
+                                        
+                                    geometry_stats['inside_cone'] += 1
+
+                                    cosine_angle = np.clip(forward_distance / object_distance, -1.0, 1.0)
+                                    angle_deg = float(np.degrees(np.arccos(cosine_angle)))
+                                    normalized_distance = perpendicular_distance / max(allowed_distance, 1e-9)
+
+                                    candidate_stats['match_count'] += 1
+                                    candidate_stats['angles_deg'].append(angle_deg)
+                                    candidate_stats['perpendicular_distances_m'].append(perpendicular_distance)
+                                    candidate_stats['forward_distances_m'].append(forward_distance)
+                                    candidate_stats['activities'].append(float(direction_state.get('activity', 0.0)))
+
+                                    if normalized_distance < candidate_stats['best_normalized_distance']:
+                                        candidate_stats['best_normalized_distance'] = normalized_distance
+                                        candidate_stats['best_match_timestamp_ns'] = timestamp_ns
+
+                            for object_id, evidence in object_stats.items():
+                                tested_count = evidence['tested_count']
+                                match_count = evidence['match_count']
+
+                                if tested_count < self.minimum_geometry_test_count:
+                                    geometry_stats['insufficient_support'] += 1
+                                    continue
+
+                                match_ratio = float(match_count) / float(tested_count)
+
+                                if match_count == 0 or match_ratio < self.minimum_geometry_match_ratio:
+                                    geometry_stats['insufficient_support'] += 1
+                                    continue
+
+                                visual_candidates.append({
+                                    'world_object_id': object_id,
+                                    'tested_count': tested_count,
+                                    'match_count': match_count,
+                                    'match_ratio': match_ratio,
+                                    'mean_angle_deg': float(np.mean(evidence['angles_deg'])),
+                                    'mean_perpendicular_distance_m': float(np.mean(evidence['perpendicular_distances_m'])),
+                                    'mean_forward_distance_m': float(np.mean(evidence['forward_distances_m'])),
+                                    'mean_sst_activity': float(np.mean(evidence['activities'])),
+                                    'best_match_timestamp_ns': int(evidence['best_match_timestamp_ns'])
+                                })
+
+                            visual_candidates.sort(key=lambda candidate: (-candidate['match_ratio'], candidate['mean_angle_deg'], candidate['mean_perpendicular_distance_m']))
+
+                            self.get_logger().info(
+                                f"Geometry obs="
+                                f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                                f"directions="
+                                f"{geometry_stats['direction_count']}, "
+                                f"sampled="
+                                f"{geometry_stats['sampled_direction_count']}, "
+                                f"tf_failures="
+                                f"{geometry_stats['tf_failures']}, "
+                                f"missing_states="
+                                f"{geometry_stats['missing_visual_states']}, "
+                                f"tested_states="
+                                f"{geometry_stats['tested_object_states']}, "
+                                f"behind="
+                                f"{geometry_stats['behind_direction']}, "
+                                f"outside_cone="
+                                f"{geometry_stats['outside_cone']}, "
+                                f"inside_cone="
+                                f"{geometry_stats['inside_cone']}, "
+                                f"insufficient_support="
+                                f"{geometry_stats['insufficient_support']}, "
+                                f"returned={len(visual_candidates)}"
+                            )
+
+                    if closest_object_debug is None:
+                        self.get_logger().info(
+                            f"Closest geometry obs="
+                            f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                            f"no comparable visual object state"
+                        )
+                    else:
+                        debug = closest_object_debug
+
+                        self.get_logger().info(
+                            f"Closest geometry obs="
+                            f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                            f"object={debug['world_object_id']}, "
+                            f"angle={debug['angle_deg']:.1f} deg, "
+                            f"distance={debug['object_distance_m']:.2f} m, "
+                            f"forward={debug['forward_distance_m']:.2f} m, "
+                            f"perpendicular="
+                            f"{debug['perpendicular_distance_m']:.2f} m, "
+                            f"allowed={debug['allowed_distance_m']:.2f} m"
+                        )
+
+                    # Narrow down the candidate list by comparing all modalities together with AudioCLIP
+                    audioclip_candidates = []
+                    image_tensors = []
+
+                    for candidate in visual_candidates:
+                        # Get nearest visual observation
+                        visual_observation = None
+                        with self.obs_lock:
+                            cached_observations = list(self.obs_cache.get(int(candidate['world_object_id']), []))
+
+                            if cached_observations:
+                                nearest_observation = min(cached_observations, key=lambda observation: abs(int(observation['timestamp_ns']) - int(candidate['best_match_timestamp_ns'])))
+
+                                time_difference_s = abs(int(nearest_observation['timestamp_ns']) - int(candidate['best_match_timestamp_ns'])) / 1e9
+
+                                self.get_logger().info(
+                                    f"Crop timing obs="
+                                    f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                                    f"object={candidate['world_object_id']}, "
+                                    f"difference={time_difference_s:.3f}s, "
+                                    f"limit="
+                                    f"{self.maximum_crop_time_difference_s:.3f}s, "
+                                    f"accepted="
+                                    f"{time_difference_s <= self.maximum_crop_time_difference_s}"
+                                )
+
+                                if time_difference_s <= self.maximum_crop_time_difference_s:
+                                    visual_observation = nearest_observation
+                            else:
+                                self.get_logger().info(
+                                    f"Crop timing obs="
+                                    f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                                    f"object={candidate['world_object_id']}, "
+                                    f"no cached visual observations"
+                                )
+
+                        if visual_observation is None: continue
+
+                        image_tensor = None
+
+                        # Preprocess visual crop image
+                        compressed_data = np.frombuffer(bytes(visual_observation['crop'].data), dtype=np.uint8)
+                        crop_bgr = cv2.imdecode(compressed_data, cv2.IMREAD_COLOR)
+
+                        if crop_bgr is not None and crop_bgr.size != 0:
+                            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                            crop_pil = Image.fromarray(crop_rgb)
+
+                            image_tensor = self.image_transforms(crop_pil)
+
+                        if image_tensor is None: continue
+
+                        # Prepare audioclip candidates
+                        audioclip_candidate = dict(candidate)
+                        audioclip_candidate['visual_observation_timestamp_ns'] = int(visual_observation['timestamp_ns'])
+                        audioclip_candidate['visual_label'] = str(visual_observation['label'])
+                        audioclip_candidate['visual_confidence'] = float(visual_observation['confidence'])
+                        audioclip_candidates.append(audioclip_candidate)
+
+                        image_tensors.append(image_tensor)
+
+                    if image_tensors:
+                        image_batch = torch.stack(image_tensors, dim=0).to(self.aclp.device)
+                        with torch.no_grad():
+                            ((_, image_features, _), _), _ = self.aclp(image=image_batch)
+
+                        image_features = image_features / torch.linalg.norm(image_features, dim=-1, keepdim=True).clamp_min(1e-9)
+                        normalized_audio_feature = audio_features[audio_idx].detach().to(self.aclp.device)
+                        normalized_audio_feature = normalized_audio_feature / torch.linalg.norm(normalized_audio_feature).clamp_min(1e-9)
+
+                        similarities = (image_features @ normalized_audio_feature.reshape(-1, 1)).squeeze(1)
+
+                        for candidate, similarity in zip(audioclip_candidates, similarities):
+                            candidate['audio_image_similarity'] = float(similarity.item())
+
+                        audioclip_candidates.sort(key=lambda candidate: (-candidate['audio_image_similarity'], -candidate['match_ratio'], candidate['mean_angle_deg']))
+                    else:
+                        audioclip_candidates = []
+
+                    audio_observations[audio_idx]['geometric_visual_candidates'] = visual_candidates
+                    audio_observations[audio_idx]['semantic_visual_candidates'] = audioclip_candidates
+
+                    # Update associated visual-to audio edges
+                    audio_node = self.audio_graph_nodes[audio_node_id]
+                    audio_node['latest_visual_candidates'] = audioclip_candidates
+
+                    accepted_id = None
+                    accepted_similarity = None
+                    accepted = False
+
+                    if not visual_candidates:
+                        status = 'no_geometric_candidate'
+                    elif not audioclip_candidates:
+                        status = 'no_visual_crop'
+                    else:
+                        top_candidate = audioclip_candidates[0]
+                        top_similarity = float(top_candidate['audio_image_similarity'])
+
+                        if len(audioclip_candidates) > 1:
+                            second_similarity = float(audioclip_candidates[1]['audio_image_similarity'])
+                            similarity_margin = top_similarity - second_similarity
+                        else:
+                            similarity_margin = float('inf')
+
+                        top_candidate['similarity_margin'] = similarity_margin
+                        sufficient_similarity = top_similarity >= self.minimum_audio_image_similarity
+                        sufficient_margin = similarity_margin >= self.minimum_audio_image_margin
+
+                        if sufficient_similarity and sufficient_margin:
+                            accepted_id = int(top_candidate['world_object_id'])
+                            accepted_similarity = top_similarity
+                            accepted = True
+                            status = 'semantic_candidate'
+                        else:
+                            status = 'ambiguous'
+
+                    history_entry = {
+                        'audio_obs_id': int(audio_observations[audio_idx]['audio_obs_id']),
+                        'start_ns': int(audio_observations[audio_idx]['start_ns']),
+                        'end_ns': int(audio_observations[audio_idx]['end_ns']),
+                        'accepted_world_object_id': accepted_id,
+                        'accepted': accepted,
+                        'latest_status': status,
+                        'candidates': [
+                            {
+                                'world_object_id': int(candidate['world_object_id']),
+                                'match_ratio': float(candidate['match_ratio']),
+                                'audio_image_similarity': float(candidate['audio_image_similarity']),
+                            }
+                            for candidate in audioclip_candidates
+                        ]
+                    }
+
+                    audio_node['candidate_history'].append(history_entry)
+                    audio_node['latest_visual_grounding_status'] = status
+
+                    if accepted:
+                        audio_node['consecutive_visual_misses'] = 0
+                        existing_association = audio_node.get('associated_world_object_id')
+
+                        if existing_association == accepted_id:
+                            audio_node['visual_grounding_status'] = 'associated'
+                        elif existing_association is None:
+                            audio_node['visual_grounding_status'] = 'semantic_candidate'
+                        else:
+                            audio_node['visual_grounding_status'] = 'ambiguous'
+                    else:
+                        existing_association = audio_node.get("associated_world_object_id")
+
+                        if existing_association is None:
+                            audio_node["consecutive_visual_misses"] = 0
+                            audio_node["visual_grounding_status"] = status
+                        else:
+                            audio_node["consecutive_visual_misses"] += 1
+
+                            if audio_node["consecutive_visual_misses"] >= 3:
+                                audio_node["visual_grounding_status"] = "lost_visual"
+
+                        if existing_association is None:
+                            audio_node['visual_grounding_status'] = status
+                        elif audio_node['consecutive_visual_misses'] >= 3:
+                            audio_node['visual_grounding_status'] = 'lost_visual'
+
+                    if accepted:
+                        recent_history = list(audio_node['candidate_history'])
+                        accepted_support_count = sum(1 for entry in recent_history if entry['accepted_world_object_id'] == accepted_id and entry['accepted'])
+                        accepted_support_ratio = float(accepted_support_count) / float(len(recent_history))
+                        edge_key = (int(audio_node_id), int(accepted_id), 'audio_visual')
+
+                        if edge_key not in self.audio_visual_edges:
+                            self.audio_visual_edges[edge_key] = {
+                                'audio_node_id': int(audio_node_id),
+                                'world_object_id': int(accepted_id),
+                                'type': 'audio_visual',
+                                'first_seen_ns': int(audio_observations[audio_idx]['start_ns']),
+                                'last_seen_ns': int(audio_observations[audio_idx]['end_ns']),
+                                'support_count': 0,
+                                'support_ratio': 0.0,
+                                'latest_audio_image_similarity': accepted_similarity,
+                                'recent_evidence': deque(maxlen=10),
+                                'active': True,
+                                'confirmed': False
+                            }
+
+                        edge = self.audio_visual_edges[edge_key]
+
+                        edge['last_seen_ns'] = int(audio_observations[audio_idx]['end_ns'])
+                        edge['support_count'] += 1
+                        edge['support_ratio'] = accepted_support_ratio
+                        edge['latest_audio_image_similarity'] = accepted_similarity
+                        edge['active'] = True
+                        edge['recent_evidence'].append({
+                            'audio_obs_id': int(audio_observations[audio_idx]['audio_obs_id']),
+                            'timestamp_ns': int(audio_observations[audio_idx]['end_ns']),
+                            'audio_image_similarity': float(accepted_similarity),
+                            'match_ratio': float(audioclip_candidates[0]['match_ratio'])
+                        })
+
+                        confirmed = accepted_support_count >= self.minimum_edge_support_count and accepted_support_ratio >= self.minimum_edge_support_ratio
+                        edge['confirmed'] = bool(edge.get('confirmed', False) or confirmed)
+
+                        if confirmed:
+                            for other_edge_key, other_edge in self.audio_visual_edges.items():
+                                if other_edge_key == edge_key:
+                                    continue
+
+                                if int(other_edge['audio_node_id']) == int(audio_node_id):
+                                    other_edge['active'] = False
+
+                            edge['active'] = True
+                            edge['confirmed'] = True
+
+                            audio_node['visual_grounding_status'] = 'associated'
+                            audio_node['associated_world_object_id'] = accepted_id
+
+                    self.audio_graph_nodes[audio_node_id]['past_observations'].append(audio_observations[audio_idx].copy())
+                    audio_node = self.audio_graph_nodes[audio_node_id]
+
+                    self.get_logger().info(
+                        f"Audio observation "
+                        f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                        f"audio_node={audio_node_id}, "
+                        f"audio_assignment={association_mode}, "
+                        f"ODAS="
+                        f"{audio_observations[audio_idx]['odas_source_id']}, "
+                        f"channel="
+                        f"{audio_observations[audio_idx]['channel_idx']}, "
+                        f"observation_label="
+                        f"{audio_observations[audio_idx]['label']}, "
+                        f"persistent_label="
+                        f"{audio_node['label']}, "
+                        f"geometric_candidates="
+                        f"{len(visual_candidates)}, "
+                        f"semantic_candidates="
+                        f"{[(candidate['world_object_id'], round(candidate['audio_image_similarity'], 3)) for candidate in audioclip_candidates]}, "
+                        f"latest_status="
+                        f"{audio_node['latest_visual_grounding_status']}, "
+                        f"persistent_status="
+                        f"{audio_node['visual_grounding_status']}, "
+                        f"associated_object="
+                        f"{audio_node['associated_world_object_id']}, "
+                        f"visual_misses="
+                        f"{audio_node['consecutive_visual_misses']}"
+                    )
+                    
                     # visualize classification results (temporarily before creating and visualizing audio graph nodes)
                     # text_marker = Marker()
                     # text_marker.header = sss_header
@@ -931,6 +1482,8 @@ class AudioCLIPSub(Node):
                 delete_marker.action = Marker.DELETEALL
                 audio_graph_marker_array.markers.append(delete_marker)
 
+                audio_display_positions = {}
+
                 for node in self.audio_graph_nodes.values():
                     if not node.get("active", False): continue
 
@@ -973,6 +1526,14 @@ class AudioCLIPSub(Node):
                     # fixed marker position since audio not yet matched with a visual object
                     display_position_map = mic_position_map + direction_map
                     audio_node_id = int(node["audio_node_id"])
+
+                    audio_display_positions[audio_node_id] = np.array([
+                            float(display_position_map[0]),
+                            float(display_position_map[1]),
+                            float(display_position_map[2] + 1.5),
+                        ],
+                        dtype=np.float64
+                    )
 
                     # audio node marker
                     node_marker = Marker()
@@ -1029,6 +1590,76 @@ class AudioCLIPSub(Node):
                     )
 
                     audio_graph_marker_array.markers.append(text_marker)
+
+                # Visualize audio-to-visual node association edges
+                audio_visual_edge_marker = Marker()
+
+                audio_visual_edge_marker.header.stamp = sss_header.stamp
+                audio_visual_edge_marker.header.frame_id = "walp/map"
+                audio_visual_edge_marker.ns = "audio_visual_edges"
+                audio_visual_edge_marker.id = 0
+                audio_visual_edge_marker.type = Marker.LINE_LIST
+                audio_visual_edge_marker.action = Marker.ADD
+                audio_visual_edge_marker.pose.orientation.w = 1.0
+
+                audio_visual_edge_marker.scale.x = 0.04
+                audio_visual_edge_marker.color.r = 1.0
+                audio_visual_edge_marker.color.g = 0.85
+                audio_visual_edge_marker.color.b = 0.10
+                audio_visual_edge_marker.color.a = 1.0
+
+                with self.wo_lock:
+                    visual_node_snapshot = {
+                        int(world_object_id): {
+                            'position_map': np.asarray(visual_node['position_map'], dtype=np.float64).copy(),
+                            'active': bool(visual_node.get('active', False))
+                        }
+                        for world_object_id, visual_node in self.visual_graph_nodes.items()
+                    }
+
+                for edge in self.audio_visual_edges.values():
+                    if edge.get('type') != 'audio_visual': continue
+                    if not edge.get('confirmed', False): continue
+                    if not edge.get('active', False): continue
+
+                    edge_audio_node_id = int(edge['audio_node_id'])
+                    edge_world_object_id = int(edge['world_object_id'])
+
+                    audio_node = self.audio_graph_nodes.get(edge_audio_node_id)
+                    visual_node = visual_node_snapshot.get(edge_world_object_id)
+
+                    if audio_node is None or visual_node is None: continue
+                    if not audio_node.get('active', False): continue
+                    if audio_node.get('visual_grounding_status') != 'associated':
+                        continue
+
+                    if audio_node.get('associated_world_object_id') != edge_world_object_id:
+                        continue
+
+                    if not visual_node['active']:
+                        continue
+
+                    audio_position = audio_display_positions.get(edge_audio_node_id)
+
+                    if audio_position is None: continue
+
+                    visual_position = visual_node['position_map']
+
+                    audio_point = Point()
+                    audio_point.x = float(audio_position[0])
+                    audio_point.y = float(audio_position[1])
+                    audio_point.z = float(audio_position[2])
+
+                    visual_point = Point()
+                    visual_point.x = float(visual_position[0])
+                    visual_point.y = float(visual_position[1])
+                    visual_point.z = float(visual_position[2])
+
+                    audio_visual_edge_marker.points.append(audio_point)
+                    audio_visual_edge_marker.points.append(visual_point)
+
+                if audio_visual_edge_marker.points:
+                    audio_graph_marker_array.markers.append(audio_visual_edge_marker)
 
                 self.audio_graph_viz_pub.publish(audio_graph_marker_array)
                 # self.sss_pub.publish(marker_array)
