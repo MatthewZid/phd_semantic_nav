@@ -128,8 +128,8 @@ class AudioCLIPSub(Node):
         # ]
         self.LABELS = [
             'human talking',
-            'footsteps',
-            'door open or close',
+            # 'footsteps',
+            # 'door open or close',
             'car engine',
             # 'cat',
             'alarm clock'
@@ -154,20 +154,33 @@ class AudioCLIPSub(Node):
         self.sst_cone_half_angle_deg = 15.0
         self.visual_state_maximum_age_s = 5.0
         self.visual_state_future_tolerance_s = 0.1
+        # Maximum time between two visual states that may be
+        # interpolated.
+        self.visual_interpolation_maximum_gap_s = 3.0
+
+        # Additional uncertainty introduced while predicting a moving
+        # visual object from an older state.
+        self.visual_extrapolation_uncertainty_rate = 0.15
         self.maximum_sst_samples_per_clip = 40
 
         self.minimum_geometry_test_count = 3
         self.minimum_geometry_match_ratio = 0.3
 
         # self.maximum_crop_time_difference_s = 1.0
-        self.maximum_crop_time_difference_s = 5.0
+        self.maximum_crop_time_difference_s = 2.0
 
         # Initial semantic verification parameters (must be tweaked accordingly)
         self.minimum_audio_image_similarity = 0.14
         self.minimum_audio_image_margin = 0.02
+        # Margin applied to the joint geometric-semantic score.
+        self.minimum_association_score_margin = 0.01
 
         self.minimum_edge_support_count = 2
         self.minimum_edge_support_ratio = 0.6
+        # Replacing an established edge requires stronger evidence
+        # than creating the initial edge.
+        self.minimum_switch_support_count = 3
+        self.minimum_switch_support_ratio = 0.75
         self.odas_source_id_priority_timeout_s = 6.0
 
         self.obs_cache = defaultdict(lambda: deque(maxlen=20)) # cache memory for recent visual observation messages
@@ -744,6 +757,73 @@ class AudioCLIPSub(Node):
         for audio_node_id in nodes_to_delete:
             del self.audio_graph_nodes[audio_node_id]
     
+    def select_visual_state(self, state_history, timestamp_ns):
+        if not state_history: return None
+
+        previous_states = [state for state in state_history if int(state['timestamp_ns']) <= int(timestamp_ns)]
+        future_states = [state for state in state_history if int(state['timestamp_ns']) > int(timestamp_ns)]
+
+        previous_state = max(previous_states, key=lambda state: int(state['timestamp_ns'])) if previous_states else None
+        future_state = min(future_states, key=lambda state: int(state['timestamp_ns'])) if future_states else None
+
+        if previous_state is not None and future_state is not None:
+            previous_ns = int(previous_state['timestamp_ns'])
+            future_ns = int(future_state['timestamp_ns'])
+
+            visual_gap_s = (future_ns - previous_ns) / 1e9
+
+            if future_ns > previous_ns and visual_gap_s <= self.visual_interpolation_maximum_gap_s:
+                alpha = float(timestamp_ns - previous_ns) / float(future_ns - previous_ns)
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+
+                previous_position = np.asarray(previous_state['position_map'], dtype=np.float64)
+                future_position = np.asarray(future_state['position_map'], dtype=np.float64)
+
+                previous_velocity = np.asarray(previous_state['velocity_map'], dtype=np.float64)
+                future_velocity = np.asarray(future_state['velocity_map'], dtype=np.float64)
+
+                return {
+                    'timestamp_ns': int(timestamp_ns),
+                    'position_map': (1.0 - alpha) * previous_position + alpha * future_position,
+                    'velocity_map': (1.0 - alpha) * previous_velocity + alpha * future_velocity,
+                    'radius_m': max(float(previous_state['radius_m']), float(future_state['radius_m'])),
+                    'position_uncertainty_m': max((previous_state['position_uncertainty_m']), float(future_state['position_uncertainty_m'])),
+                    'active': previous_state['active'] or future_state['active'],
+                }
+
+        # use velocity to predict future position if no future state exists
+        if previous_state is not None:
+            age_s = (int(timestamp_ns) - int(previous_state['timestamp_ns'])) / 1e9
+
+            if 0.0 <= age_s <= self.visual_state_maximum_age_s:
+                previous_position = np.asarray(previous_state['position_map'], dtype=np.float64)
+                previous_velocity = np.asarray(previous_state['velocity_map'], dtype=np.float64)
+
+                return {
+                    'timestamp_ns': int(timestamp_ns),
+                    'position_map': previous_position + previous_velocity * age_s,
+                    'velocity_map': previous_velocity.copy(),
+                    'radius_m': float(previous_state['radius_m']),
+                    'position_uncertainty_m': float(previous_state['position_uncertainty_m']) + self.visual_extrapolation_uncertainty_rate * age_s,
+                    'active': bool(previous_state['active'])
+                }
+
+        # Future state time offset if future state exists
+        if future_state is not None:
+            future_difference_s = (int(future_state['timestamp_ns']) - int(timestamp_ns)) / 1e9
+
+            if 0.0 <= future_difference_s <= self.visual_state_future_tolerance_s:
+                return {
+                    'timestamp_ns': int(future_state['timestamp_ns']),
+                    'position_map': np.asarray(future_state['position_map'], dtype=np.float64).copy(),
+                    'velocity_map': np.asarray(future_state['velocity_map'], dtype=np.float64).copy(),
+                    'radius_m': float(future_state['radius_m']),
+                    'position_uncertainty_m': float(future_state['position_uncertainty_m']),
+                    'active': bool(future_state['active']),
+                }
+
+        return None
+
     def inference_thread(self):
         while rclpy.ok():
             minibatch = []
@@ -1023,29 +1103,13 @@ class AudioCLIPSub(Node):
                                 direction_map /= direction_map_norm
 
                                 for object_id, state_history in visual_histories.items():
-                                    state = None
-                                    if not state_history: continue
-
-                                    maximum_age_ns = int(self.visual_state_maximum_age_s * 1e9)
-                                    future_tolerance_ns = int(self.visual_state_future_tolerance_s * 1e9)
-                                    previous_states = [prev_state for prev_state in state_history if int(prev_state['timestamp_ns']) <= int(timestamp_ns)]
-
-                                    if previous_states:
-                                        selected_state = max(previous_states, key=lambda previous_state: int(previous_state['timestamp_ns']))
-
-                                        age_ns = int(timestamp_ns) - int(selected_state['timestamp_ns'])
-
-                                        if age_ns <= maximum_age_ns:
-                                            state = selected_state
-
-                                    if state is None:
-                                        future_states = [future_state for future_state in state_history if 0 <= (int(future_state['timestamp_ns']) - int(timestamp_ns)) <= future_tolerance_ns]
-
-                                        if future_states:
-                                            state = min(future_states, key=lambda future_state: int(future_state['timestamp_ns']))
+                                    state = self.select_visual_state(state_history=state_history, timestamp_ns=timestamp_ns)
 
                                     if state is None:
                                         geometry_stats['missing_visual_states'] += 1
+                                        continue
+
+                                    if not state.get('active', False):
                                         continue
 
                                     geometry_stats['tested_object_states'] += 1
@@ -1257,9 +1321,15 @@ class AudioCLIPSub(Node):
                         similarities = (image_features @ normalized_audio_feature.reshape(-1, 1)).squeeze(1)
 
                         for candidate, similarity in zip(audioclip_candidates, similarities):
-                            candidate['audio_image_similarity'] = float(similarity.item())
+                            audio_image_similarity = float(similarity.item())
+                            candidate['audio_image_similarity'] = audio_image_similarity
+                            semantic_score = max(audio_image_similarity, 0.0)
+                            geometric_score = float(candidate['match_ratio'])
 
-                        audioclip_candidates.sort(key=lambda candidate: (-candidate['audio_image_similarity'], -candidate['match_ratio'], candidate['mean_angle_deg']))
+                            # An association needs both semantic and spatial support
+                            candidate['association_score'] = semantic_score * geometric_score
+
+                        audioclip_candidates.sort(key=lambda candidate: (-candidate['association_score'], candidate['mean_angle_deg']))
                     else:
                         audioclip_candidates = []
 
@@ -1281,16 +1351,17 @@ class AudioCLIPSub(Node):
                     else:
                         top_candidate = audioclip_candidates[0]
                         top_similarity = float(top_candidate['audio_image_similarity'])
+                        top_association_score = float(top_candidate['association_score'])
 
                         if len(audioclip_candidates) > 1:
-                            second_similarity = float(audioclip_candidates[1]['audio_image_similarity'])
-                            similarity_margin = top_similarity - second_similarity
+                            second_association_score = float(audioclip_candidates[1]['association_score'])
+                            association_margin = top_association_score - second_association_score
                         else:
-                            similarity_margin = float('inf')
+                            association_margin = float('inf')
 
-                        top_candidate['similarity_margin'] = similarity_margin
+                        top_candidate['association_margin'] = association_margin
                         sufficient_similarity = top_similarity >= self.minimum_audio_image_similarity
-                        sufficient_margin = similarity_margin >= self.minimum_audio_image_margin
+                        sufficient_margin = association_margin >= self.minimum_association_score_margin
 
                         if sufficient_similarity and sufficient_margin:
                             accepted_id = int(top_candidate['world_object_id'])
@@ -1312,6 +1383,7 @@ class AudioCLIPSub(Node):
                                 'world_object_id': int(candidate['world_object_id']),
                                 'match_ratio': float(candidate['match_ratio']),
                                 'audio_image_similarity': float(candidate['audio_image_similarity']),
+                                'association_score': float(candidate['association_score'])
                             }
                             for candidate in audioclip_candidates
                         ]
@@ -1331,16 +1403,16 @@ class AudioCLIPSub(Node):
                         else:
                             audio_node['visual_grounding_status'] = 'ambiguous'
                     else:
-                        existing_association = audio_node.get("associated_world_object_id")
+                        existing_association = audio_node.get('associated_world_object_id')
 
                         if existing_association is None:
-                            audio_node["consecutive_visual_misses"] = 0
-                            audio_node["visual_grounding_status"] = status
+                            audio_node['consecutive_visual_misses'] = 0
+                            audio_node['visual_grounding_status'] = status
                         else:
-                            audio_node["consecutive_visual_misses"] += 1
+                            audio_node['consecutive_visual_misses'] += 1
 
-                            if audio_node["consecutive_visual_misses"] >= 3:
-                                audio_node["visual_grounding_status"] = "lost_visual"
+                            if audio_node['consecutive_visual_misses'] >= 3:
+                                audio_node['visual_grounding_status'] = 'lost_visual'
 
                         if existing_association is None:
                             audio_node['visual_grounding_status'] = status
@@ -1386,7 +1458,16 @@ class AudioCLIPSub(Node):
                             'match_ratio': float(audioclip_candidates[0]['match_ratio'])
                         })
 
-                        confirmed = accepted_support_count >= self.minimum_edge_support_count and accepted_support_ratio >= self.minimum_edge_support_ratio
+                        existing_association = audio_node.get('associated_world_object_id')
+
+                        if existing_association is None or int(existing_association) == int(accepted_id):
+                            required_support_count = self.minimum_edge_support_count
+                            required_support_ratio = self.minimum_edge_support_ratio
+                        else:
+                            required_support_count = self.minimum_switch_support_count
+                            required_support_ratio = self.minimum_switch_support_ratio
+
+                        confirmed = accepted_support_count >= required_support_count and accepted_support_ratio >= required_support_ratio
                         edge['confirmed'] = bool(edge.get('confirmed', False) or confirmed)
 
                         if confirmed:
@@ -1422,7 +1503,7 @@ class AudioCLIPSub(Node):
                         f"geometric_candidates="
                         f"{len(visual_candidates)}, "
                         f"semantic_candidates="
-                        f"{[(candidate['world_object_id'], candidate['visual_label'], round(candidate['audio_image_similarity'], 3), round(candidate['match_ratio'], 2)) for candidate in audioclip_candidates]}, "
+                        f"{[(candidate['world_object_id'], candidate['visual_label'], round(candidate['audio_image_similarity'], 3), round(candidate['match_ratio'], 2), round(candidate['association_score'], 3)) for candidate in audioclip_candidates]}, "
                         f"latest_status="
                         f"{audio_node['latest_visual_grounding_status']}, "
                         f"persistent_status="
