@@ -1304,7 +1304,7 @@ class AudioCLIPSub(Node):
                         maximum_crop_time_difference_s = 0.5 * audio_duration_s + self.visual_crop_latency_allowance_s
 
                         with self.obs_lock:
-                            cached_observations = list(.obs_cache.get(int(candidate["world_object_id"]), []))
+                            cached_observations = list(self.obs_cache.get(int(candidate["world_object_id"]), []))
 
                         if cached_observations:
                             nearest_observation = min(cached_observations, key=lambda observation: abs(int(observation["timestamp_ns"]) - geometry_timestamp_ns))
