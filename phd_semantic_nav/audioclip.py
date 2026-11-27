@@ -128,9 +128,9 @@ class AudioCLIPSub(Node):
         # ]
         self.LABELS = [
             'human talking',
-            # 'footsteps',
-            # 'door open or close',
-            # 'car engine',
+            'footsteps',
+            'door open or close',
+            'car engine',
             # 'cat',
             'alarm clock'
         ]
@@ -691,7 +691,7 @@ class AudioCLIPSub(Node):
 
     def create_new_node(self, observation):
         accumulated_observations = deque(maxlen=5)
-        # accumulated_observations.append(observation)
+        accumulated_observations.append(observation.copy())
 
         self.audio_graph_nodes[self.audio_node_id] = {
             'audio_node_id': self.audio_node_id,
@@ -1349,8 +1349,12 @@ class AudioCLIPSub(Node):
 
                     if accepted:
                         recent_history = list(audio_node['candidate_history'])
-                        accepted_support_count = sum(1 for entry in recent_history if entry['accepted_world_object_id'] == accepted_id and entry['accepted'])
-                        accepted_support_ratio = float(accepted_support_count) / float(len(recent_history))
+                        accepted_history = [entry for entry in recent_history if entry["accepted"]]
+                        accepted_support_count = sum(1 for entry in accepted_history if entry['accepted_world_object_id'] == int(accepted_id))
+                        if accepted_history:
+                            accepted_support_ratio = float(accepted_support_count) / float(len(accepted_history))
+                        else:
+                            accepted_support_ratio = 0.0
                         edge_key = (int(audio_node_id), int(accepted_id), 'audio_visual')
 
                         if edge_key not in self.audio_visual_edges:
@@ -1418,7 +1422,7 @@ class AudioCLIPSub(Node):
                         f"geometric_candidates="
                         f"{len(visual_candidates)}, "
                         f"semantic_candidates="
-                        f"{[(candidate['world_object_id'], round(candidate['audio_image_similarity'], 3)) for candidate in audioclip_candidates]}, "
+                        f"{[(candidate['world_object_id'], candidate['visual_label'], round(candidate['audio_image_similarity'], 3), round(candidate['match_ratio'], 2)) for candidate in audioclip_candidates]}, "
                         f"latest_status="
                         f"{audio_node['latest_visual_grounding_status']}, "
                         f"persistent_status="
