@@ -152,7 +152,16 @@ class AudioCLIPSub(Node):
         self.audio_visual_edges = {}
 
         self.sst_cone_half_angle_deg = 15.0
-        self.visual_state_maximum_age_s = 5.0
+        # Moving objects may only be extrapolated briefly.
+        self.moving_visual_state_maximum_age_s = 5.0
+        self.moving_visual_extrapolation_limit_s = 1.0
+
+        # A stationary object can retain its last map position much longer.
+        self.stationary_visual_state_maximum_age_s = 30.0
+
+        # Used only to decide whether a visual object is currently stationary.
+        self.stationary_speed_threshold_mps = 0.10
+        self.stationary_velocity_window = 5
         self.visual_state_future_tolerance_s = 0.1
         # Maximum time between two visual states that may be
         # interpolated.
@@ -167,7 +176,12 @@ class AudioCLIPSub(Node):
         self.minimum_geometry_match_ratio = 0.3
 
         # self.maximum_crop_time_difference_s = 1.0
-        self.maximum_crop_time_difference_s = 2.0
+        # self.maximum_crop_time_difference_s = 2.0
+
+        # Additional allowance for camera processing, sparse detections,
+        # and message delivery latency. Half the audio-clip duration is
+        # added dynamically during crop selection.
+        self.visual_crop_latency_allowance_s = 2.0
 
         # Initial semantic verification parameters (must be tweaked accordingly)
         self.minimum_audio_image_similarity = 0.14
@@ -183,7 +197,7 @@ class AudioCLIPSub(Node):
         self.minimum_switch_support_ratio = 0.75
         self.odas_source_id_priority_timeout_s = 6.0
 
-        self.obs_cache = defaultdict(lambda: deque(maxlen=20)) # cache memory for recent visual observation messages
+        self.obs_cache = defaultdict(lambda: deque(maxlen=50)) # cache memory for recent visual observation messages
         self.wo_lock = threading.Lock()
         self.obs_lock = threading.Lock()
 
@@ -791,21 +805,46 @@ class AudioCLIPSub(Node):
                     'active': previous_state['active'] or future_state['active'],
                 }
 
-        # use velocity to predict future position if no future state exists
+        # If there is no usable future state, use the last measured
+        # state. Stationary objects retain their map position, while
+        # moving objects are extrapolated only for a short period.
         if previous_state is not None:
-            age_s = (int(timestamp_ns) - int(previous_state['timestamp_ns'])) / 1e9
+            age_s = (int(timestamp_ns) - int(previous_state["timestamp_ns"])) / 1e9
 
-            if 0.0 <= age_s <= self.visual_state_maximum_age_s:
-                previous_position = np.asarray(previous_state['position_map'], dtype=np.float64)
-                previous_velocity = np.asarray(previous_state['velocity_map'], dtype=np.float64)
+            recent_states = sorted(previous_states, key=lambda state: int(state["timestamp_ns"]))[-self.stationary_velocity_window:]
+            recent_speeds = [float(np.linalg.norm(np.asarray(state["velocity_map"], dtype=np.float64))) for state in recent_states]
+
+            median_speed_mps = float(np.median(recent_speeds)) if recent_speeds else float("inf")
+
+            is_stationary = len(recent_speeds) >= 2 and median_speed_mps <= self.stationary_speed_threshold_mps
+
+            previous_position = np.asarray(previous_state["position_map"], dtype=np.float64)
+            previous_velocity = np.asarray(previous_state["velocity_map"], dtype=np.float64)
+
+            if is_stationary and 0.0 <= age_s <= self.stationary_visual_state_maximum_age_s:
+                return {
+                    "timestamp_ns": int(timestamp_ns),
+                    # Keep the last measured map position. Do not drift a
+                    # stationary object using noisy estimated velocity.
+                    "position_map": previous_position.copy(),
+                    "velocity_map": np.zeros(3, dtype=np.float64),
+                    "radius_m": float(previous_state["radius_m"]),
+                    "position_uncertainty_m": float(previous_state["position_uncertainty_m"]) + self.visual_extrapolation_uncertainty_rate * min(age_s, 5.0),
+                    "active": bool(previous_state["active"]),
+                }
+
+            if not is_stationary and 0.0 <= age_s <= self.moving_visual_state_maximum_age_s:
+                # Avoid projecting a moving person several seconds into the
+                # future using one noisy velocity estimate.
+                extrapolation_s = min(age_s, self.moving_visual_extrapolation_limit_s)
 
                 return {
-                    'timestamp_ns': int(timestamp_ns),
-                    'position_map': previous_position + previous_velocity * age_s,
-                    'velocity_map': previous_velocity.copy(),
-                    'radius_m': float(previous_state['radius_m']),
-                    'position_uncertainty_m': float(previous_state['position_uncertainty_m']) + self.visual_extrapolation_uncertainty_rate * age_s,
-                    'active': bool(previous_state['active'])
+                    "timestamp_ns": int(timestamp_ns),
+                    "position_map": previous_positi + previous_velocity * extrapolation_s,
+                    "velocity_map": previous_velocity.copy(),
+                    "radius_m": float(previous_state["radius_m"]),
+                    "position_uncertainty_m": float(previous_state["position_uncertainty_m"]) + self.visual_extrapolation_uncertainty_rate * age_s,
+                    "active": bool(previous_state["active"]),
                 }
 
         # Future state time offset if future state exists
@@ -917,19 +956,17 @@ class AudioCLIPSub(Node):
                         if 0 <= source_id_age_ns <= source_id_priority_timeout_ns:
                             source_id_nodes.append((candidate_node_id, node))
 
-                    channel_nodes = [(candidate_node_id, node) for candidate_node_id, node in available_nodes if int(node["latest_channel_idx"]) == observation_channel]
-
                     if source_id_nodes:
+                        # A recently observed identical ODAS ID is useful short-term
+                        # evidence, so evaluate those nodes first.
                         candidate_pool = source_id_nodes
-                        association_mode = "odas_source_id"
-
-                    elif channel_nodes:
-                        candidate_pool = channel_nodes
-                        association_mode = "channel_continuity"
-
+                        association_mode = 'odas_source_id'
                     else:
+                        # An ODAS output channel is not a persistent source identity.
+                        # When the ID changes, evaluate all currently available audio
+                        # nodes using the existing temporal, label and embedding logic.
                         candidate_pool = available_nodes
-                        association_mode = "embedding_fallback"
+                        association_mode = 'embedding_fallback'
 
                     best_node_id = None
                     best_cost = 0.3
@@ -1253,36 +1290,51 @@ class AudioCLIPSub(Node):
                     image_tensors = []
 
                     for candidate in visual_candidates:
-                        # Get nearest visual observation
+                        # Select the visual observation nearest to the geometric
+                        # direction match. A crop captured anywhere inside this audio
+                        # clip is temporally valid.
                         visual_observation = None
+
+                        audio_start_ns = int(audio_observations[audio_idx]["start_ns"])
+                        audio_end_ns = int(audio_observations[audio_idx]["end_ns"])
+                        audio_duration_s = float(audio_observations[audio_idx]["duration_sec"])
+
+                        geometry_timestamp_ns = int(candidate["best_match_timestamp_ns"])
+
+                        maximum_crop_time_difference_s = 0.5 * audio_duration_s + self.visual_crop_latency_allowance_s
+
                         with self.obs_lock:
-                            cached_observations = list(self.obs_cache.get(int(candidate['world_object_id']), []))
+                            cached_observations = list(.obs_cache.get(int(candidate["world_object_id"]), []))
 
-                            if cached_observations:
-                                nearest_observation = min(cached_observations, key=lambda observation: abs(int(observation['timestamp_ns']) - int(candidate['best_match_timestamp_ns'])))
+                        if cached_observations:
+                            nearest_observation = min(cached_observations, key=lambda observation: abs(int(observation["timestamp_ns"]) - geometry_timestamp_ns))
+                            crop_timestamp_ns = int(nearest_observation["timestamp_ns"])
 
-                                time_difference_s = abs(int(nearest_observation['timestamp_ns']) - int(candidate['best_match_timestamp_ns'])) / 1e9
+                            time_difference_s = abs(crop_timestamp_ns - geometry_timestamp_ns) / 1e9
 
-                                self.get_logger().info(
-                                    f"Crop timing obs="
-                                    f"{audio_observations[audio_idx]['audio_obs_id']}: "
-                                    f"object={candidate['world_object_id']}, "
-                                    f"difference={time_difference_s:.3f}s, "
-                                    f"limit="
-                                    f"{self.maximum_crop_time_difference_s:.3f}s, "
-                                    f"accepted="
-                                    f"{time_difference_s <= self.maximum_crop_time_difference_s}"
-                                )
+                            crop_inside_audio_interval = audio_start_ns <= crop_timestamp_ns <= audio_end_ns
 
-                                if time_difference_s <= self.maximum_crop_time_difference_s:
-                                    visual_observation = nearest_observation
-                            else:
-                                self.get_logger().info(
-                                    f"Crop timing obs="
-                                    f"{audio_observations[audio_idx]['audio_obs_id']}: "
-                                    f"object={candidate['world_object_id']}, "
-                                    f"no cached visual observations"
-                                )
+                            crop_accepted = crop_inside_audio_interval or time_difference_s <= maximum_crop_time_difference_s
+
+                            self.get_logger().info(
+                                f"Crop timing obs="
+                                f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                                f"object={candidate['world_object_id']}, "
+                                f"difference={time_difference_s:.3f}s, "
+                                f"inside_clip={crop_inside_audio_interval}, "
+                                f"limit={maximum_crop_time_difference_s:.3f}s, "
+                                f"accepted={crop_accepted}"
+                            )
+
+                            if crop_accepted:
+                                visual_observation = nearest_observation
+                        else:
+                            self.get_logger().info(
+                                f"Crop timing obs="
+                                f"{audio_observations[audio_idx]['audio_obs_id']}: "
+                                f"object={candidate['world_object_id']}, "
+                                f"no cached visual observations"
+                            )
 
                         if visual_observation is None: continue
 
